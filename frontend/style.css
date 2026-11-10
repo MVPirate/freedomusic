@@ -1,0 +1,114 @@
+:root {
+    --bg: var(--tg-theme-bg-color, #17212b);
+    --text: var(--tg-theme-text-color, #ffffff);
+    --hint: var(--tg-theme-hint-color, #708499);
+    --link: var(--tg-theme-link-color, #6ab3f3);
+    --button: var(--tg-theme-button-color, #5288c1);
+    --button-text: var(--tg-theme-button-text-color, #ffffff);
+    --secondary-bg: var(--tg-theme-secondary-bg-color, #232e3c);
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html,
+body {
+    min-height: 100%;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+}
+
+.app {
+    max-width: 480px;
+    margin: 0 auto;
+    padding: 20px 16px 32px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.title {
+    font-size: 1.5rem;
+    font-weight: 600;
+    text-align: center;
+}
+
+.field {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.field-label {
+    font-size: 0.875rem;
+    color: var(--hint);
+}
+
+input {
+    width: 100%;
+    padding: 12px 14px;
+    border: none;
+    border-radius: 12px;
+    background: var(--secondary-bg);
+    color: var(--text);
+    font-size: 1rem;
+    outline: none;
+}
+
+input::placeholder {
+    color: var(--hint);
+}
+
+button {
+    width: 100%;
+    padding: 14px 16px;
+    border: none;
+    border-radius: 12px;
+    background: var(--button);
+    color: var(--button-text);
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+button:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
+#results {
+    min-height: 24px;
+    color: var(--text);
+}
+
+.error {
+    color: #ff6b6b;
+}
+
+.status {
+    color: var(--hint);
+}
+
+.track-list {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.track-item {
+    padding: 12px 14px;
+    border-radius: 12px;
+    background: var(--secondary-bg);
+}
+
+.track-item a {
+    color: var(--link);
+}

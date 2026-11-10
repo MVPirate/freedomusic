@@ -1,0 +1,16 @@
+.env
+venv/
+__pycache__/
+*.db
+*.db-wal
+*.db-shm
+downloads/
+uploads/
+backups/
+cookies.txt
+ffmpeg.exe
+ffprobe.exe
+.idea/
+.vscode/
+*.pyc
+ngrok.exe
