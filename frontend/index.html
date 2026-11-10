@@ -51,6 +51,26 @@
             padding: 0 20px; font-weight: 600; font-size: 15px; cursor: pointer;
         }
 
+        /* --- РЕКОМЕНДАЦИИ АРТИСТОВ --- */
+        .similar-artists {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 20px;
+            animation: fadeIn 0.3s ease;
+        }
+        .artist-chip {
+            background: var(--card-hover);
+            color: white;
+            border: 1px solid rgba(255,255,255,0.1);
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .artist-chip:active { background: var(--blue); }
+
         /* --- КАРТОЧКИ ТРЕКОВ --- */
         .track-list { display: flex; flex-direction: column; gap: 12px; }
         .track-item {
@@ -152,7 +172,8 @@
         }
         .nav-item { display: flex; flex-direction: column; align-items: center; gap: 4px; color: var(--text-muted); cursor: pointer; width: 25%; }
         .nav-item.active { color: var(--blue); }
-        .nav-icon { font-size: 22px; }
+        .nav-icon { width: 24px; height: 24px; fill: currentColor; margin-bottom: 2px; transition: transform 0.2s; }
+        .nav-item:active .nav-icon { transform: scale(0.9); }
         .nav-label { font-size: 10px; font-weight: 500; }
 
         /* --- МИНИ-ПЛЕЕР (GLASSMORPHISM) --- */
@@ -239,10 +260,40 @@
 
         audio { display: none; }
 
-        /* --- МОДАЛЬНЫЕ ОКНА --- */
-        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); backdrop-filter: blur(5px); z-index: 2000; justify-content: flex-end; flex-direction: column; }
-        .modal-content { background: var(--card-bg); padding: 20px; border-radius: 24px 24px 0 0; width: 100%; animation: slideUp 0.3s ease; }
-        @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+        /* --- МОДАЛЬНЫЕ ОКНА (ПЛАВНЫЕ АНИМАЦИИ) --- */
+        .modal-overlay { 
+            display: flex; position: fixed; top: 0; left: 0; width: 100%; height: 100%; 
+            background: rgba(0,0,0,0.8); backdrop-filter: blur(5px); 
+            z-index: 2000; justify-content: flex-end; flex-direction: column; 
+            
+            /* Плавное появление/исчезновение фона */
+            opacity: 0; pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+        .modal-overlay.show { opacity: 1; pointer-events: all; }
+        
+        .modal-content { 
+            position: relative; max-height: 90vh; overflow-y: auto; 
+            background: var(--card-bg); padding: 20px; 
+            border-radius: 24px 24px 0 0; width: 100%; 
+            
+            /* Плавный выезд снизу */
+            transform: translateY(100%);
+            transition: transform 0.3s cubic-bezier(0.25, 1, 0.5, 1);
+        }
+        .modal-overlay.show .modal-content {
+            transform: translateY(0);
+        }
+        
+        .modal-close-btn {
+            position: absolute; top: 15px; right: 15px;
+            background: transparent; border: none; color: var(--text-muted);
+            cursor: pointer; padding: 5px; display: flex; align-items: center;
+            justify-content: center; transition: color 0.2s; z-index: 10;
+        }
+        .modal-close-btn:hover { color: white; }
+        .modal-close-btn svg { width: 20px; height: 20px; stroke: currentColor; stroke-width: 2.5; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+
         .action-menu { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; margin-bottom: 20px; }
         .action-btn-modal { background: var(--card-hover); color: white; border: none; padding: 15px; border-radius: 12px; font-weight: 600; font-size: 15px; text-align: left; display: flex; align-items: center; gap: 10px; cursor: pointer; }
         .action-btn-modal.danger { color: #ff453a; }
@@ -318,7 +369,7 @@
 
     <div id="toast-container"></div>
 
-    <div id="tab-profile" class="tab-content active">
+    <div id="tab-profile" class="tab-content">
         <div class="header-title">Профиль <span>⚙️</span></div>
         
         <div class="profile-header">
@@ -371,7 +422,7 @@
         <button class="btn-create-pl" onclick="switchTab('playlists')">+ Создать плейлист</button>
     </div>
 
-    <div id="tab-search" class="tab-content">
+    <div id="tab-search" class="tab-content active">
         <div class="header-title">Поиск</div>
         <div class="search-container">
             <div class="search-input-wrapper">
@@ -380,6 +431,7 @@
             </div>
             <button class="btn-search" onclick="searchMusic()">Найти</button>
         </div>
+        <div id="similar-artists-container" class="similar-artists"></div>
         <div id="search-results" class="track-list"></div>
     </div>
 
@@ -499,23 +551,30 @@
     </div>
 
     <div class="bottom-nav">
-        <div class="nav-item active" id="nav-profile" onclick="switchTab('profile')">
-            <span class="nav-icon">👤</span><span class="nav-label">Профиль</span>
+        <div class="nav-item" id="nav-profile" onclick="switchTab('profile')">
+            <svg class="nav-icon" viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+            <span class="nav-label">Профиль</span>
         </div>
-        <div class="nav-item" id="nav-search" onclick="switchTab('search')">
-            <span class="nav-icon">🔍</span><span class="nav-label">Поиск</span>
+        <div class="nav-item active" id="nav-search" onclick="switchTab('search')">
+            <svg class="nav-icon" viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+            <span class="nav-label">Поиск</span>
         </div>
         <div class="nav-item" id="nav-playlists" onclick="switchTab('playlists')">
-            <span class="nav-icon">📂</span><span class="nav-label">Плейлисты</span>
+            <svg class="nav-icon" viewBox="0 0 24 24"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
+            <span class="nav-label">Плейлисты</span>
         </div>
         <div class="nav-item" id="nav-market" onclick="switchTab('market')">
-            <span class="nav-icon">🛒</span><span class="nav-label">Маркетплейс</span>
+            <svg class="nav-icon" viewBox="0 0 24 24"><path d="M7 18c-1.1 0-1.99.9-1.99 2S5.9 22 7 22s2-.9 2-2-.9-2-2-2zM1 2v2h2l3.6 7.59-1.35 2.45c-.16.28-.25.61-.25.96 0 1.1.9 2 2 2h12v-2H7.42c-.14 0-.25-.11-.25-.25l.03-.12.9-1.63h7.45c.75 0 1.41-.41 1.75-1.03l3.58-6.49c.08-.14.12-.31.12-.48 0-.55-.45-1-1-1H5.21l-.94-2H1zm16 16c-1.1 0-1.99.9-1.99 2s.89 2 1.99 2 2-.9 2-2-.9-2-2-2z"/></svg>
+            <span class="nav-label">Маркетплейс</span>
         </div>
     </div>
 
     <!-- Модальное окно действий (плейлисты) -->
     <div id="action-modal" class="modal-overlay" onclick="closeActionModal(event)">
         <div class="modal-content" onclick="event.stopPropagation()">
+            <button class="modal-close-btn" onclick="closeActionModal()">
+                <svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"></path></svg>
+            </button>
             <div style="width: 40px; height: 4px; background: #3a3a3c; border-radius: 2px; margin: 0 auto 15px auto;"></div>
             <h3 style="margin-top:0; text-align: center;" id="action-title">Действия</h3>
             <div id="action-buttons" class="action-menu"></div>
@@ -525,6 +584,9 @@
     <!-- Модальное окно статистики -->
     <div id="stats-modal" class="modal-overlay" onclick="closeStats(event)">
         <div class="modal-content" onclick="event.stopPropagation()">
+            <button class="modal-close-btn" onclick="closeStats()">
+                <svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"></path></svg>
+            </button>
             <div style="width: 40px; height: 4px; background: #3a3a3c; border-radius: 2px; margin: 0 auto 15px auto;"></div>
             <h3 style="margin-top:0; text-align: center; margin-bottom: 20px;">📊 Твоя статистика</h3>
             <div class="stats-grid" id="stats-grid"></div>
@@ -534,6 +596,9 @@
     <!-- Шторка действий с треком (Яндекс-стайл) -->
     <div id="track-sheet-modal" class="modal-overlay" onclick="closeTrackSheet(event)">
         <div class="modal-content" onclick="event.stopPropagation()">
+            <button class="modal-close-btn" onclick="closeTrackSheet()">
+                <svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"></path></svg>
+            </button>
             <div style="width: 40px; height: 4px; background: #3a3a3c; border-radius: 2px; margin: 0 auto 15px auto;"></div>
             
             <div class="track-sheet-header">
@@ -728,8 +793,11 @@
             if (data.level_progress) {
                 const lp = data.level_progress;
                 document.getElementById('level-progress-bar').style.width = `${lp.progress_percent}%`;
-                if (lp.remaining > 0) document.getElementById('level-text').innerText = `${data.xp} XP / ${data.xp + lp.remaining} XP`;
-                else document.getElementById('level-text').innerText = `Максимальный уровень!`;
+                if (lp.remaining > 0) {
+                    document.getElementById('level-text').innerText = `${data.xp} XP (до следующего: ${lp.remaining} XP)`;
+                } else {
+                    document.getElementById('level-text').innerText = `Максимальный уровень! (${data.xp} XP)`;
+                }
             }
             
             if (data.is_premium) {
@@ -745,7 +813,7 @@
             const modal = document.getElementById('stats-modal');
             const grid = document.getElementById('stats-grid');
             grid.innerHTML = '<p style="text-align:center; color:var(--text-muted); grid-column: span 2;">Загрузка...</p>';
-            modal.style.display = 'flex';
+            modal.classList.add('show');
             try {
                 const response = await apiFetch('/api/stats');
                 const data = await response.json();
@@ -761,7 +829,7 @@
 
         function closeStats(e) {
             if(e && e.target !== document.getElementById('stats-modal')) return;
-            document.getElementById('stats-modal').style.display = 'none';
+            document.getElementById('stats-modal').classList.remove('show');
         }
 
         function toggleLevels() {
@@ -839,6 +907,9 @@
                     <div class="skeleton-box skeleton-actions"></div>
                 </div>
             `).join('');
+            
+            // Сбрасываем старые рекомендации при новом поиске
+            document.getElementById('similar-artists-container').innerHTML = '';
 
             const response = await apiFetch(`/api/search?q=${encodeURIComponent(query)}`);
             const data = await response.json();
@@ -875,6 +946,23 @@
                 `;
             });
             resultsDiv.innerHTML = html;
+
+            // Рендерим похожих исполнителей
+            const similarDiv = document.getElementById('similar-artists-container');
+            if (data.similar_artists && data.similar_artists.length > 0) {
+                let similarHtml = '<span style="font-size:12px; color:var(--text-muted); width:100%; margin-bottom:5px;">Похожие исполнители:</span>';
+                data.similar_artists.forEach(artist => {
+                    similarHtml += `<button class="artist-chip" onclick="searchByArtist('${escapeHTML(artist)}')">${escapeHTML(artist)}</button>`;
+                });
+                similarDiv.innerHTML = similarHtml;
+            } else {
+                similarDiv.innerHTML = '';
+            }
+        }
+
+        function searchByArtist(artistName) {
+            document.getElementById('search-input').value = artistName;
+            searchMusic();
         }
 
         function openTrackSheet(index, playlistId) {
@@ -905,12 +993,12 @@
                 adminDeleteBtn.style.display = 'none'; 
             }
 
-            document.getElementById('track-sheet-modal').style.display = 'flex';
+            document.getElementById('track-sheet-modal').classList.add('show');
         }
 
         function closeTrackSheet(e) {
             if(e && e.target !== document.getElementById('track-sheet-modal')) return;
-            document.getElementById('track-sheet-modal').style.display = 'none';
+            document.getElementById('track-sheet-modal').classList.remove('show');
             currentSheetTrack = null;
             currentSheetPlaylistId = null;
         }
@@ -1335,12 +1423,12 @@
             const delBtn = document.createElement('button');
             delBtn.className = 'action-btn-modal danger'; delBtn.innerHTML = '🗑 Удалить плейлист';
             delBtn.onclick = () => deletePlaylist(playlistId); btnContainer.appendChild(delBtn);
-            document.getElementById('action-modal').style.display = 'flex';
+            document.getElementById('action-modal').classList.add('show');
         }
 
         function closeActionModal(e) {
             if(e && e.target !== document.getElementById('action-modal')) return;
-            document.getElementById('action-modal').style.display = 'none';
+            document.getElementById('action-modal').classList.remove('show');
             currentActionPlaylistId = null;
         }
 
@@ -1490,7 +1578,7 @@
             const listDiv = document.getElementById('action-buttons');
             document.getElementById('action-title').innerText = "Куда добавить?";
             listDiv.innerHTML = 'Загрузка...';
-            modal.style.display = 'flex';
+            modal.classList.add('show');
 
             const response = await apiFetch('/api/playlists');
             const data = await response.json();

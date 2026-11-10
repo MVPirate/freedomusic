@@ -20,7 +20,7 @@ from backend.database import (
     delete_user_playlist, remove_playlist_from_market,
     toggle_like, get_user_liked_tracks, get_user_liked_track_ids, get_user_stats,
     report_track, remove_track_from_playlist, get_playlist_by_id,
-    set_playlist_custom_cover
+    set_playlist_custom_cover, get_similar_artists
 )
 
 logger = logging.getLogger(__name__)
@@ -134,7 +134,15 @@ async def api_search(request: Request):
             "id": t["id"], "artist": t["artist"], "title": t["title"], "quality": quality,
             "is_liked": t["id"] in liked_ids
         })
-    return {"tracks": result}
+        
+    # --- НОВАЯ ЛОГИКА РЕКОМЕНДАЦИЙ ---
+    similar_artists = []
+    if result:
+        # Берем главного артиста из первого трека
+        main_artist = result[0]["artist"].split(",")[0].strip()
+        similar_artists = await get_similar_artists(main_artist, limit=5)
+        
+    return {"tracks": result, "similar_artists": similar_artists}
 
 @app.post("/api/download/{track_id}")
 async def api_download(track_id: int, request: Request):

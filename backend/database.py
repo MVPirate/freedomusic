@@ -587,3 +587,23 @@ async def set_playlist_custom_cover(playlist_id: int, cover_path: str) -> bool:
         await conn.execute("UPDATE user_playlists SET custom_cover = ? WHERE id = ?", (cover_path, playlist_id))
         await conn.commit()
         return True
+
+async def get_similar_artists(artist_name: str, limit: int = 5) -> list[str]:
+    """Ищет артистов, которые часто встречаются в одних плейлистах с заданным."""
+    async with get_db() as conn:
+        # Ищем пересечения в плейлистах
+        query = """
+            SELECT t2.artist, COUNT(*) as freq
+            FROM tracks t1
+            JOIN playlist_tracks pt1 ON t1.id = pt1.track_id
+            JOIN playlist_tracks pt2 ON pt1.playlist_id = pt2.playlist_id
+            JOIN tracks t2 ON pt2.track_id = t2.id
+            WHERE LOWER(t1.artist) LIKE LOWER(?) 
+              AND LOWER(t2.artist) NOT LIKE LOWER(?)
+            GROUP BY t2.artist
+            ORDER BY freq DESC
+            LIMIT ?
+        """
+        async with conn.execute(query, (f"%{artist_name}%", f"%{artist_name}%", limit)) as cursor:
+            rows = await cursor.fetchall()
+            return [row["artist"] for row in rows]
