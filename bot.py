@@ -7,6 +7,7 @@ import sys
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
@@ -28,7 +29,8 @@ from backend.database import (
     search_tracks, get_track_by_id, increment_track_download,
     get_user_by_internal_id, give_premium, remove_premium,
     update_track_metadata, delete_track, replace_track_file,
-    create_user_playlist, get_user_playlist_by_title, add_track_to_playlist 
+    create_user_playlist, get_user_playlist_by_title, add_track_to_playlist,
+    set_playlist_trailer, set_playlist_custom_cover
 )
 from backend.parser import detect_source, parse_playlist, get_yandex_client
 from backend.downloader import (
@@ -47,6 +49,7 @@ load_dotenv()
 
 BASE_DIR: Path = Path(__file__).resolve().parent
 UPLOADS_DIR: Path = BASE_DIR / "uploads"
+TRAILERS_DIR: Path = UPLOADS_DIR / "trailers"
 WEBAPP_STUB_URL: str = "https://flattery-defuse-yogurt.ngrok-free.dev"
 
 session = AiohttpSession(timeout=300)
@@ -280,7 +283,6 @@ async def cmd_import(message: Message, command: CommandObject) -> None:
         limit_reached = False
         tracks_to_download = []
         
-        # ИСПОЛЬЗУЕМ ENUMERATE ДЛЯ СОХРАНЕНИЯ ПОРЯДКА
         for idx, track in enumerate(tracks):
             if added_to_queue >= remaining_limit:
                 limit_reached = True
@@ -291,7 +293,6 @@ async def cmd_import(message: Message, command: CommandObject) -> None:
             existing_track_id = await check_track_exists(artist, title)
             
             if existing_track_id:
-                # ПЕРЕДАЕМ IDX В ФУНКЦИЮ
                 success = await add_track_to_playlist(new_pl_id, existing_track_id, position=idx)
                 if success:
                     await message.answer(f"⏩ Добавлен из базы в плейлист: {artist} - {title}")
@@ -310,8 +311,6 @@ async def cmd_import(message: Message, command: CommandObject) -> None:
                 is_last = (idx == len(tracks_to_download) - 1)
                 artist, title = track.get('artist', 'Unknown'), track.get('title', 'Unknown')
                 
-                # Тут тоже передаем реальный индекс из плейлиста (вместо idx используем индекс в общем списке)
-                # Чтобы не путаться, берем позицию из общего списка
                 real_position = tracks.index(track)
                 
                 await download_queue.put({
@@ -467,7 +466,6 @@ async def _send_next_moderation_track(message: Message, admin_internal_id: int):
     
     file_path = Path(track["file_path"]) if track["file_path"] else None
 
-    # --- НЕТ ФАЙЛА (ОШИБКА СКАЧИВАНИЯ) ---
     if not file_path:
         orig_dur = track.get("original_duration", 0)
         imp_src = track.get("import_source", "unknown")
@@ -573,7 +571,6 @@ async def process_moderation(callback: CallbackQuery):
 
     if not track: return await callback.answer("Трек не найден.", show_alert=True)
 
-    # --- КНОПКА "НАЙТИ НА SOUNDCLOUD" ---
     if action == "soundcloud":
         await callback.answer("Ищу на SoundCloud...")
         query = f"{track['artist']} - {track['title']}"
@@ -592,7 +589,6 @@ async def process_moderation(callback: CallbackQuery):
             await callback.answer("❌ Не удалось найти трек на SoundCloud.", show_alert=True)
         return
 
-    # --- КНОПКА "ПРИСЛАТЬ ВЕСЬ ТРЕК" ---
     if action == "full":
         if track_id in processing_full_tracks:
             await callback.answer("⏳ Трек уже загружается, подождите...", show_alert=True)
@@ -670,7 +666,6 @@ async def process_moderation(callback: CallbackQuery):
             processing_full_tracks.discard(track_id)
         return
 
-    # --- КНОПКА "СКАЧАТЬ ВРУЧНУЮ" ---
     if action == "manual":
         await callback.answer()
         waiting_for_replacement[callback.from_user.id] = track_id
@@ -688,7 +683,6 @@ async def process_moderation(callback: CallbackQuery):
         await callback.message.answer(caption, parse_mode="Markdown")
         return
 
-    # --- СТАНДАРТНЫЕ (ОДОБРИТЬ / ОТКЛОНИТЬ) ---
     await callback.answer("Обрабатываю...")
     try:
         if action == "approve":
@@ -710,9 +704,48 @@ async def process_moderation(callback: CallbackQuery):
 
     await _send_next_moderation_track(callback.message, int(admin_user["id"]))
 
-# --- ОБРАБОТЧИК АУДИО (ЗАГРУЗКА ФАЙЛА) ---
+# --- НОВАЯ ЛОГИКА ДЛЯ ТРЕЙЛЕРОВ ---
+async def process_trailer(message: Message, file_obj: Any):
+    """Логика сохранения трейлера"""
+    try:
+        text = message.reply_to_message.text
+        # Извлекаем ID плейлиста с помощью регулярки для надежности
+        match = re.search(r"ID: (\d+)", text)
+        if not match: 
+            await message.answer("❌ Не удалось распознать ID плейлиста. Попробуй заново.")
+            return
+            
+        playlist_id = int(match.group(1))
+        
+        if file_obj.file_size > 3 * 1024 * 1024:
+            await message.answer("❌ Файл слишком большой! Максимум 3 МБ.")
+            return
+            
+        TRAILERS_DIR.mkdir(parents=True, exist_ok=True)
+        
+        ext = Path(file_obj.file_name or "trailer.mp3").suffix or ".mp3"
+        if ext.lower() not in ['.mp3', '.wav', '.ogg', '.m4a']:
+             ext = ".mp3"
+             
+        dest = TRAILERS_DIR / f"trailer_{playlist_id}_{file_obj.file_unique_id}{ext}"
+        
+        await message.answer("⏳ Скачиваю и сохраняю трейлер...")
+        await bot.download(file_obj, destination=dest)
+        
+        await set_playlist_trailer(playlist_id, str(dest))
+        
+        await message.answer(f"✅ Трейлер успешно прикреплен к плейлисту ID: {playlist_id}!\nЗайди в приложение, чтобы послушать.")
+    except Exception as e:
+        log(f"Ошибка сохранения трейлера: {e}")
+        await message.answer("❌ Ошибка при сохранении трейлера. Попробуй еще раз.")
+
+# --- ОБРАБОТЧИК АУДИО ---
 @dp.message(F.audio)
 async def handle_audio(message: Message) -> None:
+    if message.reply_to_message and message.reply_to_message.text and "ID:" in message.reply_to_message.text:
+        await process_trailer(message, message.audio)
+        return
+
     try:
         user = await _ensure_user(message)
         audio = message.audio
@@ -771,24 +804,20 @@ async def handle_audio(message: Message) -> None:
             dest.rename(final_dest)
             dest = final_dest
 
-        # --- ПРОВЕРКА, ЖДЕМ ЛИ МЫ ЗАМЕНЫ ---
         if is_replacement:
             track_id_to_replace = waiting_for_replacement.pop(message.from_user.id)
             old_path = await replace_track_file(track_id_to_replace, str(dest), bitrate, duration)
             
-            # ИСПРАВЛЕНИЕ: Удаляем старый файл, только если его путь отличается от нового
             if old_path and old_path != str(dest) and Path(old_path).exists():
                 try: Path(old_path).unlink()
                 except: pass
                 
             await message.answer(f"✅ Файл успешно заменен! Новая длительность: {duration} сек.\n\n⏳ Отправляю на повторную модерацию...")
             
-            # Отправляем на модерацию
             admin_user = await get_user(message.from_user.id)
             await _send_next_moderation_track(message, int(admin_user["id"]))
             return
 
-        # --- ЕСЛИ ЭТО ОБЫЧНАЯ ЗАГРУЗКА ---
         points_reward = 15 if (bitrate >= 320 or ext.lower() in ['.flac', '.wav']) and duration >= 90 else 5
         try:
             await upload_track(
@@ -807,6 +836,75 @@ async def handle_audio(message: Message) -> None:
         log(f"Ошибка обработки аудио: {exc}")
         await message.answer("Не удалось отправить трек.")
 
+# --- НОВЫЙ ОБРАБОТЧИК ДОКУМЕНТОВ ---
+@dp.message(F.document)
+async def handle_document(message: Message) -> None:
+    if message.reply_to_message and message.reply_to_message.text:
+        text = message.reply_to_message.text
+        
+        # Если это ответ на запрос обложки
+        if "ID:" in text and "обложки" in text:
+            try:
+                match = re.search(r"ID: (\d+)", text)
+                if not match: return await message.answer("❌ Не удалось распознать ID плейлиста.")
+                playlist_id = int(match.group(1))
+                
+                if message.document.file_size > 5 * 1024 * 1024:
+                    return await message.answer("❌ Файл слишком большой! Максимум 5 МБ.")
+                    
+                COVERS_DIR = UPLOADS_DIR / "covers"
+                COVERS_DIR.mkdir(parents=True, exist_ok=True)
+                dest = COVERS_DIR / f"cover_{playlist_id}.jpg"
+                
+                await message.answer("⏳ Скачиваю и сохраняю обложку...")
+                await bot.download(message.document, destination=dest)
+                await set_playlist_custom_cover(playlist_id, str(dest))
+                await message.answer(f"✅ Обложка успешно прикреплена к плейлисту ID: {playlist_id}!\nОбнови приложение, чтобы увидеть результат.")
+            except Exception as e:
+                log(f"Ошибка сохранения обложки: {e}")
+                await message.answer("❌ Ошибка при сохранении обложки.")
+            return
+            
+        # Если это ответ на запрос трейлера
+        if "ID:" in text:
+            await process_trailer(message, message.document)
+            return
+            
+    await message.answer("Я пока учусь! Используй /help")
+
+# --- ОБРАБОТЧИК ФОТО (ОБЛОЖКИ ПЛЕЙЛИСТОВ) ---
+@dp.message(F.photo)
+async def handle_photo(message: Message) -> None:
+    if message.reply_to_message and message.reply_to_message.text and "ID:" in message.reply_to_message.text and "обложки" in message.reply_to_message.text:
+        try:
+            text = message.reply_to_message.text
+            match = re.search(r"ID: (\d+)", text)
+            if not match: 
+                return await message.answer("❌ Не удалось распознать ID плейлиста.")
+                
+            playlist_id = int(match.group(1))
+            
+            # Берем картинку в максимальном разрешении
+            photo = message.photo[-1]
+            
+            if photo.file_size > 5 * 1024 * 1024:
+                return await message.answer("❌ Файл слишком большой! Максимум 5 МБ.")
+                
+            COVERS_DIR = UPLOADS_DIR / "covers"
+            COVERS_DIR.mkdir(parents=True, exist_ok=True)
+            
+            dest = COVERS_DIR / f"cover_{playlist_id}.jpg"
+            
+            await message.answer("⏳ Скачиваю и сохраняю обложку...")
+            await bot.download(photo, destination=dest)
+            
+            await set_playlist_custom_cover(playlist_id, str(dest))
+            
+            await message.answer(f"✅ Обложка успешно прикреплена к плейлисту ID: {playlist_id}!\nОбнови приложение, чтобы увидеть результат.")
+        except Exception as e:
+            log(f"Ошибка сохранения обложки: {e}")
+            await message.answer("❌ Ошибка при сохранении обложки. Попробуй еще раз.")
+
 # --- ОБРАБОТЧИК ТЕКСТА (ССЫЛКИ НА SOUNDCLOUD) ---
 @dp.message(F.text)
 async def handle_text(message: Message) -> None:
@@ -824,14 +922,12 @@ async def handle_text(message: Message) -> None:
             try:
                 file_path, err, src_url = await download_from_soundcloud_url(url, track["artist"], track["title"])
                 
-                # --- ПРОВЕРКА РАЗМЕРА ФАЙЛА ---
                 if file_path and Path(file_path).exists() and Path(file_path).stat().st_size > 50_000:
                     br, dur = await asyncio.to_thread(get_audio_info, Path(file_path))
                     await asyncio.to_thread(fix_audio_tags, file_path, track["artist"], track["title"])
                     
                     old_path = await replace_track_file(track_id, file_path, br, dur, new_source_url=src_url)
                     
-                    # ИСПРАВЛЕНИЕ: Удаляем старый файл, только если его путь отличается от нового
                     if old_path and old_path != file_path and Path(old_path).exists():
                         try: Path(old_path).unlink()
                         except: pass

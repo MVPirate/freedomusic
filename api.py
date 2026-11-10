@@ -10,16 +10,17 @@ from aiogram import Bot
 from aiogram.types import FSInputFile, LabeledPrice
 from aiogram.utils.web_app import safe_parse_webapp_init_data
 
-from backend.config import TELEGRAM_BOT_TOKEN, ADMIN_ID # <-- ДОБАВЛЕН ADMIN_ID
+from backend.config import TELEGRAM_BOT_TOKEN, ADMIN_ID
 from backend.database import (
     get_user, claim_daily, search_tracks, check_download_limit, 
     increment_download_count, get_track_by_id, increment_track_download, 
-    add_points, get_user_by_internal_id, delete_track, # <-- ДОБАВЛЕН delete_track
+    add_points, get_user_by_internal_id, delete_track,
     create_user_playlist, get_user_playlists, add_track_to_playlist, get_playlist_tracks,
     get_level_progress, set_playlist_price, get_market_playlists, buy_playlist,
     delete_user_playlist, remove_playlist_from_market,
     toggle_like, get_user_liked_tracks, get_user_liked_track_ids, get_user_stats,
-    report_track, remove_track_from_playlist
+    report_track, remove_track_from_playlist, get_playlist_by_id,
+    set_playlist_custom_cover
 )
 
 logger = logging.getLogger(__name__)
@@ -257,7 +258,8 @@ async def api_add_to_playlist(playlist_id: int, request: Request):
 @app.get("/api/playlists/{playlist_id}")
 async def api_get_playlist_tracks(playlist_id: int):
     tracks = await get_playlist_tracks(playlist_id)
-    return {"tracks": tracks}
+    playlist = await get_playlist_by_id(playlist_id)
+    return {"tracks": tracks, "playlist": playlist}
 
 @app.delete("/api/playlists/{playlist_id}/track/{track_id}")
 async def api_remove_track_from_playlist(playlist_id: int, track_id: int):
@@ -269,7 +271,96 @@ async def api_report_track(track_id: int):
     await report_track(track_id)
     return {"ok": True, "msg": "Жалоба отправлена. Спасибо, что помогаете бороться с цензурой!"}
 
-# --- НОВЫЙ ЭНДПОИНТ ДЛЯ АДМИНА ---
+# --- НОВЫЕ ЭНДПОИНТЫ ДЛЯ ТРЕЙЛЕРОВ ---
+@app.post("/api/playlists/{playlist_id}/request_trailer")
+async def api_request_trailer(playlist_id: int, request: Request):
+    tg_id = await get_tg_user_id(request)
+    if not tg_id: return {"error": "Нет данных"}
+    
+    playlist = await get_playlist_by_id(playlist_id)
+    if not playlist: return {"error": "Плейлист не найден"}
+
+    try:
+        await bot.send_message(
+            chat_id=tg_id,
+            text=f"🎵 Отправь мне аудиофайл для трейлера плейлиста **{playlist['title']}** (ID: {playlist_id})\n\n"
+                 f"⚠️ **В ответ на это сообщение!** (нажми на него и выбери 'Ответить', затем прикрепи MP3 или файл).\n"
+                 f"Размер файла: до 3 МБ. Длительность: до 30 секунд.",
+            parse_mode="Markdown"
+        )
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Ошибка запроса трейлера: {e}")
+        return {"error": "Не удалось отправить сообщение в Telegram"}
+
+@app.get("/api/stream_trailer/{playlist_id}")
+async def api_stream_trailer(playlist_id: int):
+    playlist = await get_playlist_by_id(playlist_id)
+    
+    # 1. Проверяем трейлер у текущего плейлиста
+    if playlist and playlist.get("trailer_path"):
+        file_path = Path(playlist["trailer_path"])
+        if file_path.exists():
+            return FileResponse(file_path, media_type="audio/mpeg")
+
+    # 2. Если это купленный плейлист, проверяем трейлер у оригинала
+    if playlist and playlist.get("original_playlist_id"):
+        orig_playlist = await get_playlist_by_id(playlist["original_playlist_id"])
+        if orig_playlist and orig_playlist.get("trailer_path"):
+            orig_path = Path(orig_playlist["trailer_path"])
+            if orig_path.exists():
+                return FileResponse(orig_path, media_type="audio/mpeg")
+
+    return {"error": "Трейлер не найден"}
+
+# --- ЭНДПОИНТЫ ОБЛОЖЕК ПЛЕЙЛИСТОВ ---
+@app.post("/api/playlists/{playlist_id}/request_cover")
+async def api_request_cover(playlist_id: int, request: Request):
+    tg_id = await get_tg_user_id(request)
+    if not tg_id: return {"error": "Нет данных"}
+    
+    playlist = await get_playlist_by_id(playlist_id)
+    if not playlist: return {"error": "Плейлист не найден"}
+
+    try:
+        await bot.send_message(
+            chat_id=tg_id,
+            text=f"🖼 Отправь мне картинку для обложки плейлиста **{playlist['title']}** (ID: {playlist_id})\n\n"
+                 f"⚠️ **В ответ на это сообщение!** (нажми на него и выбери 'Ответить', затем прикрепи фото).\n"
+                 f"Размер файла: до 5 МБ.",
+            parse_mode="Markdown"
+        )
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Ошибка запроса обложки: {e}")
+        return {"error": "Не удалось отправить сообщение в Telegram"}
+
+@app.get("/api/stream_playlist_cover/{playlist_id}")
+async def api_stream_playlist_cover(playlist_id: int):
+    # 1. Проверяем кастомную обложку у текущего плейлиста
+    playlist = await get_playlist_by_id(playlist_id)
+    if playlist and playlist.get("custom_cover"):
+        file_path = Path(playlist["custom_cover"])
+        if file_path.exists():
+            return FileResponse(file_path)
+    
+    # 2. Если это купленный плейлист, проверяем обложку у оригинала
+    if playlist and playlist.get("original_playlist_id"):
+        orig_playlist = await get_playlist_by_id(playlist["original_playlist_id"])
+        if orig_playlist and orig_playlist.get("custom_cover"):
+            orig_path = Path(orig_playlist["custom_cover"])
+            if orig_path.exists():
+                return FileResponse(orig_path)
+
+    # 3. Если обложек нет, берем обложку первого трека
+    tracks = await get_playlist_tracks(playlist_id)
+    if tracks:
+        return RedirectResponse(url=f"/api/cover/{tracks[0]['id']}")
+    
+    # 4. Если плейлист пуст, отдаем дефолтную папку
+    return RedirectResponse(url="https://cdn-icons-png.flaticon.com/512/3844/3844724.png")
+
+# --- ЭНДПОИНТ ДЛЯ АДМИНА ---
 @app.delete("/api/admin/delete_track/{track_id}")
 async def api_admin_delete_track(track_id: int, request: Request):
     tg_id = await get_tg_user_id(request)

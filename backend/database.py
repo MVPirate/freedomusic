@@ -82,6 +82,7 @@ async def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER REFERENCES users(id),
                 title TEXT NOT NULL, is_public BOOLEAN DEFAULT 0, price INTEGER DEFAULT 0,
                 sales_count INTEGER DEFAULT 0, original_playlist_id INTEGER DEFAULT NULL,
+                trailer_path TEXT DEFAULT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS playlist_tracks (
@@ -109,10 +110,8 @@ async def init_db() -> None:
             """
         )
         
-        # --- АВТООЧИСТКА БИТЫХ СВЯЗЕЙ ---
         await conn.execute("DELETE FROM playlist_tracks WHERE track_id NOT IN (SELECT id FROM tracks)")
         await conn.execute("DELETE FROM likes WHERE track_id NOT IN (SELECT id FROM tracks)")
-        
         await conn.execute("INSERT INTO tracks_fts(tracks_fts) VALUES('rebuild')")
         
         async with conn.execute("PRAGMA table_info(users)") as cursor:
@@ -139,6 +138,8 @@ async def init_db() -> None:
             if "price" not in cols: await conn.execute("ALTER TABLE user_playlists ADD COLUMN price INTEGER DEFAULT 0")
             if "sales_count" not in cols: await conn.execute("ALTER TABLE user_playlists ADD COLUMN sales_count INTEGER DEFAULT 0")
             if "original_playlist_id" not in cols: await conn.execute("ALTER TABLE user_playlists ADD COLUMN original_playlist_id INTEGER DEFAULT NULL")
+            if "trailer_path" not in cols: await conn.execute("ALTER TABLE user_playlists ADD COLUMN trailer_path TEXT DEFAULT NULL")
+            if "custom_cover" not in cols: await conn.execute("ALTER TABLE user_playlists ADD COLUMN custom_cover TEXT DEFAULT NULL")
         await conn.commit()
 
 async def get_user(telegram_id: int) -> dict[str, Any]:
@@ -410,26 +411,29 @@ async def create_user_playlist(user_id: int, title: str) -> dict[str, Any]:
 async def get_user_playlists(user_id: int) -> list[dict[str, Any]]:
     async with get_db() as conn:
         async with conn.execute(
-            """SELECT p.id, p.title, p.price, p.is_public, p.sales_count, p.original_playlist_id, COUNT(pt.track_id) as track_count, orig_u.username as original_seller_username, orig_u.telegram_id as original_seller_tg
+            """SELECT p.id, p.title, p.price, p.is_public, p.sales_count, p.original_playlist_id, p.trailer_path, p.custom_cover, COUNT(pt.track_id) as track_count, orig_u.username as original_seller_username, orig_u.telegram_id as original_seller_tg
                FROM user_playlists p LEFT JOIN playlist_tracks pt ON p.id = pt.playlist_id LEFT JOIN user_playlists orig_p ON p.original_playlist_id = orig_p.id LEFT JOIN users orig_u ON orig_p.user_id = orig_u.id
                WHERE p.user_id = ? GROUP BY p.id""", (user_id,)) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
-# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ---
+async def get_playlist_by_id(playlist_id: int) -> dict[str, Any] | None:
+    async with get_db() as conn:
+        async with conn.execute("SELECT * FROM user_playlists WHERE id = ?", (playlist_id,)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
 async def add_track_to_playlist(playlist_id: int, track_id: int, position: int = 0) -> bool:
     async with get_db() as conn:
         async with conn.execute("SELECT id FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?", (playlist_id, track_id)) as cursor:
             row = await cursor.fetchone()
             
         if row:
-            # Если трек уже есть, обновляем его позицию (для порядка)
             await conn.execute("UPDATE playlist_tracks SET position = ? WHERE playlist_id = ? AND track_id = ?", (position, playlist_id, track_id))
         else:
             await conn.execute("INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)", (playlist_id, track_id, position))
             
         await conn.commit()
         return True
-# -----------------------------
 
 async def get_playlist_tracks(playlist_id: int) -> list[dict[str, Any]]:
     async with get_db() as conn:
@@ -553,22 +557,33 @@ async def get_user_stats(user_id: int) -> dict[str, Any]:
         return {"likes": likes, "playlists": playlists, "uploaded": uploaded, "downloaded": downloaded}
 
 async def report_track(track_id: int) -> bool:
-    """Увеличивает счетчик жалоб на трек."""
     async with get_db() as conn:
         await conn.execute("UPDATE tracks SET complaint_count = complaint_count + 1 WHERE id = ?", (track_id,))
         await conn.commit()
         return True
 
 async def remove_track_from_playlist(playlist_id: int, track_id: int) -> bool:
-    """Удаляет трек из конкретного плейлиста."""
     async with get_db() as conn:
         await conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?", (playlist_id, track_id))
         await conn.commit()
         return True
 
 async def get_user_playlist_by_title(user_id: int, title: str) -> dict[str, Any] | None:
-    """Ищет плейлист пользователя по точному названию."""
     async with get_db() as conn:
         async with conn.execute("SELECT id FROM user_playlists WHERE user_id = ? AND title = ? ORDER BY id DESC LIMIT 1", (user_id, title)) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+async def set_playlist_trailer(playlist_id: int, trailer_path: str) -> bool:
+    """Привязывает путь к трейлеру для плейлиста."""
+    async with get_db() as conn:
+        await conn.execute("UPDATE user_playlists SET trailer_path = ? WHERE id = ?", (trailer_path, playlist_id))
+        await conn.commit()
+        return True
+
+async def set_playlist_custom_cover(playlist_id: int, cover_path: str) -> bool:
+    """Привязывает путь к кастомной обложке плейлиста."""
+    async with get_db() as conn:
+        await conn.execute("UPDATE user_playlists SET custom_cover = ? WHERE id = ?", (cover_path, playlist_id))
+        await conn.commit()
+        return True

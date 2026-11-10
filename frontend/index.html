@@ -131,6 +131,10 @@
         .folder-icon.orange { background: linear-gradient(135deg, #f12711, #f5af19); }
         .folder-icon.teal { background: linear-gradient(135deg, #11998e, #38ef7d); }
         .folder-icon.red { background: linear-gradient(135deg, #ff0844, #ffb199); }
+        .playlist-cover {
+            width: 50px; height: 50px; border-radius: 12px; object-fit: cover;
+            background: #333; flex-shrink: 0;
+        }
         .market-info { flex-grow: 1; }
         .market-title { font-weight: 600; font-size: 15px; }
         .market-sub { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
@@ -266,6 +270,48 @@
         .sheet-action-icon svg { width: 24px; height: 24px; fill: white; }
         .sheet-action-btn.liked .sheet-action-icon { color: var(--red); }
         .sheet-action-btn.liked .sheet-action-icon svg { fill: var(--red); }
+
+        /* --- СТИЛИ ДЛЯ ШАПКИ ПЛЕЙЛИСТА --- */
+        .playlist-header-row {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 20px;
+            padding: 0 5px;
+        }
+        .playlist-header-cover {
+            width: 90px;
+            height: 90px;
+            border-radius: 16px;
+            object-fit: cover;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.5);
+            flex-shrink: 0;
+            background: #333;
+        }
+        .playlist-header-info {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            overflow: hidden;
+        }
+        .playlist-header-info h2 {
+            margin: 0 0 10px 0;
+            text-align: left;
+            font-size: 24px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            width: 100%;
+        }
+
+        /* --- СТИЛИ ДЛЯ ТРЕЙЛЕРА --- */
+        .trailer-btn {
+            background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2);
+            color: white; border-radius: 12px; padding: 8px 15px; font-size: 14px;
+            display: inline-flex; align-items: center; gap: 8px; cursor: pointer;
+            transition: background 0.2s; margin-bottom: 15px;
+        }
+        .trailer-btn:active { background: rgba(255,255,255,0.2); }
     </style>
 </head>
 <body>
@@ -777,7 +823,7 @@
         }
 
         function toggleLikeCurrent() {
-            if (!audioQueue[currentAudioIndex]) return;
+            if (!audioQueue[currentAudioIndex] || audioQueue[currentAudioIndex].is_trailer) return;
             toggleLike(audioQueue[currentAudioIndex].id, null);
         }
 
@@ -852,7 +898,6 @@
             if (playlistId) deleteBtn.style.display = 'flex';
             else deleteBtn.style.display = 'none';
 
-            // ПРОВЕРКА НА АДМИНА (ID: 1778878276)
             const adminDeleteBtn = document.getElementById('admin-delete-track-btn');
             if (user && String(user.id) === '1778878276') { 
                 adminDeleteBtn.style.display = 'flex'; 
@@ -1000,7 +1045,9 @@
             
             const playerBar = document.getElementById('player-bar');
             const audio = document.getElementById('audio-element');
-            const coverUrl = `/api/cover/${track.id}`;
+            
+            // Если это трейлер, используем заглушку вместо обложки
+            let coverUrl = track.is_trailer ? 'https://cdn-icons-png.flaticon.com/512/3844/3844724.png' : `/api/cover/${track.id}`;
             
             playerBar.classList.add('show');
             playerBar.classList.remove('paused');
@@ -1018,9 +1065,16 @@
             document.getElementById('fp-cover').onerror = function() { this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png' };
             document.getElementById('fp-bg').style.backgroundImage = `url('${coverUrl}')`;
             
-            updatePlayerLikeButtons(track.id);
+            // Если это трейлер, убираем сердечко, иначе ставим нужное состояние
+            if (track.is_trailer) {
+                document.getElementById('mini-like-btn').classList.remove('liked');
+                document.getElementById('fp-like-btn').classList.remove('liked');
+                audio.src = `/api/stream_trailer/${track.playlist_id}`;
+            } else {
+                updatePlayerLikeButtons(track.id);
+                audio.src = `/api/stream/${track.id}`;
+            }
             
-            audio.src = `/api/stream/${track.id}`;
             audio.play();
 
             if ('mediaSession' in navigator) {
@@ -1182,7 +1236,7 @@
                 html += `
                     <div class="market-item" onclick='viewPlaylist(${pl.id}, ${JSON.stringify(pl.title)}, ${pl.sales_count})'>
                         <div class="market-header">
-                            <div class="folder-icon">📂</div>
+                            <img src="/api/stream_playlist_cover/${pl.id}" class="playlist-cover" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
                             <div class="market-info">
                                 <div class="market-title">${escapeHTML(pl.title)}</div>
                                 <div class="market-sub">${subText}${onSale}</div>
@@ -1270,6 +1324,12 @@
                     sellBtn.innerHTML = '💰 Выставить на продажу';
                     sellBtn.onclick = () => { closeActionModal(); sellPlaylist(playlistId); }; btnContainer.appendChild(sellBtn);
                 }
+
+                const coverBtn = document.createElement('button');
+                coverBtn.className = 'action-btn-modal';
+                coverBtn.innerHTML = '🖼 Установить обложку';
+                coverBtn.onclick = () => { closeActionModal(); requestPlaylistCover(playlistId); };
+                btnContainer.appendChild(coverBtn);
             }
 
             const delBtn = document.createElement('button');
@@ -1313,16 +1373,37 @@
 
         async function viewPlaylist(playlistId, title, salesCount) {
             const listDiv = document.getElementById('playlists-list');
-            const salesInfo = salesCount > 0 ? `<div style="color:var(--green); font-size:12px; margin-bottom:15px; text-align:center;">💰 Продано копий: ${salesCount}</div>` : '';
-            
-            listDiv.innerHTML = `<button class="btn-search" style="width:auto; padding:10px 15px; margin-bottom: 15px; background:var(--card-bg);" onclick="loadPlaylists()">← Назад</button> 
-                                 <h2 style="text-align:center; margin-bottom:5px;">${escapeHTML(title)}</h2>
-                                 ${salesInfo}
-                                 <div id="pl-tracks" class="track-list"></div>`;
-            
+
+            // Сначала загружаем треки и инфу о плейлисте
             const response = await apiFetch(`/api/playlists/${playlistId}`);
             const data = await response.json();
             window.currentDisplayList = data.tracks; 
+            const currentPl = data.playlist;
+
+            const salesInfo = salesCount > 0 ? `<div style="color:var(--green); font-size:12px; margin-bottom:15px; text-align:center;">💰 Продано копий: ${salesCount}</div>` : '';
+
+            let trailerHtml = '';
+            if (currentPl && currentPl.trailer_path) {
+                trailerHtml = `<button class="trailer-btn" onclick='playTrailer(${playlistId}, ${JSON.stringify(title)})'>▶ Послушать трейлер</button>`;
+            } else if (currentPl && user && String(user.id) === '1778878276') {
+                // Только для админа
+                trailerHtml = `<button class="trailer-btn" onclick="requestTrailer(${playlistId})">🎵 Добавить трейлер</button>`;
+            }
+
+            listDiv.innerHTML = `
+                <button class="btn-search" style="width:auto; padding:10px 15px; margin-bottom: 15px; background:var(--card-bg);" onclick="loadPlaylists()">← Назад</button> 
+                
+                <div class="playlist-header-row">
+                    <img src="/api/stream_playlist_cover/${playlistId}" class="playlist-header-cover" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
+                    <div class="playlist-header-info">
+                        <h2>${escapeHTML(title)}</h2>
+                        ${trailerHtml}
+                    </div>
+                </div>
+                
+                ${salesInfo}
+                <div id="pl-tracks" class="track-list"></div>
+            `;
 
             let html = '';
             if (data.tracks.length === 0) {
@@ -1380,7 +1461,7 @@
                 html += `
                     <div class="market-item">
                         <div class="market-header">
-                            <div class="folder-icon ${colorClass}">📂</div>
+                            <img src="/api/stream_playlist_cover/${pl.id}" class="playlist-cover" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
                             <div class="market-info">
                                 <div class="market-title">${escapeHTML(pl.title)}</div>
                                 <div class="market-sub">${pl.track_count} трека • ${sellerName}</div>
@@ -1435,6 +1516,44 @@
             closeActionModal();
             if (data.error) showToast(data.error, true);
             else showToast(data.msg);
+        }
+
+        // --- ЛОГИКА ТРЕЙЛЕРОВ ---
+        let trailerAudio = null;
+
+        async function requestTrailer(playlistId) {
+            const response = await apiFetch(`/api/playlists/${playlistId}/request_trailer`, { method: 'POST' });
+            const data = await response.json();
+            if (data.error) showToast(data.error, true);
+            else showToast("Перейди в чат с ботом и ответь на сообщение файлом!");
+        }
+
+        async function requestPlaylistCover(playlistId) {
+            const response = await apiFetch(`/api/playlists/${playlistId}/request_cover`, { method: 'POST' });
+            const data = await response.json();
+            if (data.error) showToast(data.error, true);
+            else showToast("Перейди в чат с ботом и ответь на сообщение картинкой!");
+        }
+
+        function playTrailer(playlistId, playlistTitle) {
+            if (trailerAudio) {
+                trailerAudio.pause();
+                trailerAudio = null;
+            }
+            
+            // Создаем фейковый объект трека для плеера
+            const fakeTrack = {
+                id: `trailer_${playlistId}`,
+                title: `Трейлер: ${playlistTitle}`,
+                artist: 'FreeDom Music',
+                is_trailer: true,
+                playlist_id: playlistId
+            };
+            
+            // Запускаем его через основной плеер
+            audioQueue = [fakeTrack];
+            currentAudioIndex = 0;
+            playCurrentTrack();
         }
 
         // Запуск
