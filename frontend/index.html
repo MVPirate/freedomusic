@@ -51,36 +51,68 @@
             padding: 0 20px; font-weight: 600; font-size: 15px; cursor: pointer;
         }
 
-        /* --- РЕКОМЕНДАЦИИ АРТИСТОВ --- */
-        .similar-artists {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            margin-bottom: 20px;
-            animation: fadeIn 0.3s ease;
+        /* --- АРТИСТЫ (ТРЕНДЫ) --- */
+        .artist-grid {
+            display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 20px;
         }
-        .artist-chip {
-            background: var(--card-hover);
-            color: white;
-            border: 1px solid rgba(255,255,255,0.1);
-            padding: 6px 12px;
-            border-radius: 20px;
-            font-size: 13px;
-            cursor: pointer;
-            transition: background 0.2s;
+        .artist-card {
+            display: flex; flex-direction: column; align-items: center; gap: 8px;
+            cursor: pointer; transition: transform 0.2s;
         }
-        .artist-chip:active { background: var(--blue); }
+        .artist-card:active { transform: scale(0.95); }
+        .artist-avatar {
+            width: 100%; aspect-ratio: 1/1; border-radius: 50%; object-fit: cover;
+            border: 2px solid rgba(255,255,255,0.1); box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease, filter 0.2s ease;
+        }
+        .artist-name {
+            font-size: 13px; font-weight: 600; color: var(--text-main); text-align: center;
+            display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+        }
 
-        /* --- КАРТОЧКИ ТРЕКОВ --- */
+        /* --- СПИСОК ПЛЕЙЛИСТОВ (Строками) --- */
+        .playlist-row-item {
+            display: flex; align-items: center; gap: 12px;
+            background: rgba(28, 28, 30, 0.6); backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.05); box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+            border-radius: 16px; padding: 12px; margin-bottom: 12px; cursor: pointer;
+            transition: transform 0.1s ease, background 0.2s ease;
+        }
+        .playlist-row-item:active { transform: scale(0.98); background: rgba(44, 44, 46, 0.8); }
+        .playlist-row-cover { width: 64px; height: 64px; border-radius: 12px; object-fit: cover; flex-shrink: 0; background: #333; }
+
+        /* Старый скролл для похожих исполнителей */
+        .artist-scroll {
+            display: flex; gap: 10px; overflow-x: auto; padding-bottom: 5px;
+        }
+        .artist-scroll .artist-card { min-width: 80px; }
+        .artist-scroll .artist-avatar { width: 80px; height: 80px; }
+
+        /* --- ПРОФИЛЬ АРТИСТА --- */
+        .artist-header {
+            display: flex; flex-direction: column; align-items: center; margin-bottom: 25px; text-align: center;
+        }
+        .artist-header img { width: 120px; height: 120px; border-radius: 50%; margin-bottom: 15px; box-shadow: 0 8px 25px rgba(0,0,0,0.5); }
+        .artist-header h2 { font-size: 28px; margin-bottom: 5px; }
+        .artist-header p { color: var(--text-muted); font-size: 14px; margin: 0; }
+        .btn-back {
+            background: transparent; color: var(--blue); border: none; font-size: 16px;
+            font-weight: 600; display: flex; align-items: center; gap: 5px; cursor: pointer;
+            margin-bottom: 15px; padding: 0;
+        }
+
+        /* --- КАРТОЧКИ ТРЕКОВ (Glassmorphism) --- */
         .track-list { display: flex; flex-direction: column; gap: 12px; }
         .track-item {
-            background: var(--card-bg); border-radius: 16px; padding: 12px;
-            display: flex; align-items: center; gap: 12px; position: relative; overflow: hidden;
+            background: rgba(28, 28, 30, 0.6); backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.05); box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+            border-radius: 20px; padding: 12px;
+            display: flex; align-items: center; gap: 15px; position: relative; overflow: hidden;
             cursor: pointer; transition: transform 0.1s ease, background 0.2s ease;
         }
-        .track-item:active { transform: scale(0.98); background: var(--card-hover); }
+        .track-item:active { transform: scale(0.98); background: rgba(44, 44, 46, 0.8); }
+        .track-cover { width: 64px; height: 64px; border-radius: 14px; object-fit: cover; background: #333; flex-shrink: 0; }
         
-        .track-cover { width: 56px; height: 56px; border-radius: 10px; object-fit: cover; background: #333; flex-shrink: 0; }
         .track-info { flex-grow: 1; min-width: 0; pointer-events: none; }
         .track-title { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .track-artist { font-size: 13px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -96,7 +128,6 @@
         .icon-btn:active { background: rgba(255,255,255,0.1); }
         .icon-btn svg { width: 22px; height: 22px; fill: currentColor; }
         
-        /* Стили для лайкнутого сердечка */
         .icon-btn.liked { color: var(--red); }
         .icon-btn.liked svg { fill: var(--red); }
         .heart-anim { animation: pop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
@@ -129,10 +160,16 @@
         .progress-text { font-size: 12px; color: var(--text-muted); text-align: center; margin-bottom: 15px; }
         .btn-levels { background: var(--card-hover); color: white; border: none; border-radius: 12px; padding: 10px; width: 100%; font-size: 13px; font-weight: 600; display: flex; justify-content: center; align-items: center; gap: 5px; }
 
-        .premium-banner { background: linear-gradient(90deg, #d4af37 0%, #ffd700 100%); color: #000; border-radius: 16px; padding: 15px; display: flex; align-items: center; gap: 15px; cursor: pointer; margin-bottom: 20px; }
+        /* --- ПРЕМИУМ БАННЕР (Темное золото) --- */
+        .premium-banner { 
+            background: linear-gradient(135deg, #2a2205 0%, #1a1500 100%);
+            border: 1px solid rgba(255, 215, 0, 0.3); box-shadow: 0 4px 20px rgba(255, 215, 0, 0.1);
+            color: white; border-radius: 20px; padding: 15px; 
+            display: flex; align-items: center; gap: 15px; cursor: pointer; margin-bottom: 20px; 
+        }
         .premium-icon { font-size: 28px; }
-        .premium-text h4 { margin: 0; font-size: 15px; font-weight: 800; }
-        .premium-text p { margin: 2px 0 0 0; font-size: 12px; opacity: 0.8; }
+        .premium-text h4 { margin: 0; font-size: 15px; font-weight: 800; color: var(--gold); }
+        .premium-text p { margin: 4px 0 0 0; font-size: 12px; color: var(--text-muted); }
 
         .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; font-size: 16px; font-weight: 600; }
         .btn-create-pl { background: var(--card-bg); border-radius: 16px; padding: 15px; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--text-muted); font-weight: 600; border: 1px dashed #3a3a3c; width: 100%; }
@@ -143,23 +180,22 @@
         .stat-value { font-size: 24px; font-weight: 800; margin-bottom: 5px; display: flex; align-items: center; justify-content: center; gap: 8px; }
         .stat-label { font-size: 12px; color: var(--text-muted); }
 
-        /* --- МАРКЕТПЛЕЙС --- */
-        .market-item { background: var(--card-bg); border-radius: 16px; padding: 15px; display: flex; flex-direction: column; gap: 12px; margin-bottom: 12px; }
-        .market-header { display: flex; gap: 12px; align-items: center; }
-        .folder-icon { width: 50px; height: 50px; border-radius: 12px; background: linear-gradient(135deg, #007aff, #00d2ff); display: flex; justify-content: center; align-items: center; font-size: 24px; }
-        .folder-icon.purple { background: linear-gradient(135deg, #8e2de2, #4a00e0); }
-        .folder-icon.orange { background: linear-gradient(135deg, #f12711, #f5af19); }
-        .folder-icon.teal { background: linear-gradient(135deg, #11998e, #38ef7d); }
-        .folder-icon.red { background: linear-gradient(135deg, #ff0844, #ffb199); }
-        .playlist-cover {
-            width: 50px; height: 50px; border-radius: 12px; object-fit: cover;
-            background: #333; flex-shrink: 0;
+        /* --- МАРКЕТПЛЕЙС (WB/Ozon Стиль) --- */
+        .market-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .market-card-wb { 
+            background: var(--card-bg); border-radius: 16px; overflow: hidden; 
+            display: flex; flex-direction: column; border: 1px solid rgba(255,255,255,0.05);
+            cursor: pointer; transition: transform 0.1s;
         }
-        .market-info { flex-grow: 1; }
-        .market-title { font-weight: 600; font-size: 15px; }
-        .market-sub { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
-        .market-price { display: flex; align-items: center; gap: 5px; font-size: 13px; font-weight: 600; color: var(--gold); margin-top: 4px; }
-        .btn-buy-market { background: var(--green); color: white; border: none; border-radius: 10px; padding: 10px; font-weight: 600; font-size: 14px; width: 100%; cursor: pointer; }
+        .market-card-wb:active { transform: scale(0.97); }
+        .market-card-wb img { width: 100%; aspect-ratio: 1/1; object-fit: cover; background: #2c2c2e; }
+        .market-card-wb-info { padding: 10px; display: flex; flex-direction: column; gap: 4px; }
+        .market-card-wb-price { font-size: 18px; font-weight: 800; color: var(--gold); }
+        .market-card-wb-title { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .market-card-wb-seller { font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .market-card-wb-stats { font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between; margin-top: 4px; }
+
+        .btn-buy-market { background: var(--green); color: white; border: none; border-radius: 8px; padding: 8px; font-weight: 600; font-size: 13px; width: 100%; cursor: pointer; margin-top: 5px; }
         .btn-buy-market:disabled { background: #3a3a3c; color: var(--text-muted); }
 
         /* --- НИЖНЯЯ НАВИГАЦИЯ --- */
@@ -176,7 +212,7 @@
         .nav-item:active .nav-icon { transform: scale(0.9); }
         .nav-label { font-size: 10px; font-weight: 500; }
 
-        /* --- МИНИ-ПЛЕЕР (GLASSMORPHISM) --- */
+        /* --- МИНИ-ПЛЕЕР --- */
         .player-bar {
             display: none; position: fixed; bottom: calc(var(--nav-height) + 10px); left: 10px; right: 10px;
             background: rgba(30, 30, 30, 0.45); backdrop-filter: blur(30px); -webkit-backdrop-filter: blur(30px);
@@ -196,6 +232,15 @@
         
         .btn-svg { background: transparent; border: none; color: white; cursor: pointer; padding: 4px; display: flex; align-items: center; justify-content: center; }
         .btn-svg svg { width: 24px; height: 24px; fill: currentColor; }
+
+        .player-close-btn {
+            background: transparent; border: none; color: var(--text-muted);
+            width: 28px; height: 28px; border-radius: 50%; display: flex;
+            justify-content: center; align-items: center; cursor: pointer;
+            transition: background 0.2s, color 0.2s; margin-left: 4px; flex-shrink: 0;
+        }
+        .player-close-btn:active { background: rgba(255,255,255,0.1); color: white; }
+        .player-close-btn svg { width: 18px; height: 18px; fill: currentColor; }
         
         .btn-play-pause {
             width: 38px; height: 38px; border-radius: 50%; background: white; color: black;
@@ -260,15 +305,12 @@
 
         audio { display: none; }
 
-        /* --- МОДАЛЬНЫЕ ОКНА (ПЛАВНЫЕ АНИМАЦИИ) --- */
+        /* --- МОДАЛЬНЫЕ ОКНА --- */
         .modal-overlay { 
             display: flex; position: fixed; top: 0; left: 0; width: 100%; height: 100%; 
             background: rgba(0,0,0,0.8); backdrop-filter: blur(5px); 
             z-index: 2000; justify-content: flex-end; flex-direction: column; 
-            
-            /* Плавное появление/исчезновение фона */
-            opacity: 0; pointer-events: none;
-            transition: opacity 0.3s ease;
+            opacity: 0; pointer-events: none; transition: opacity 0.3s ease;
         }
         .modal-overlay.show { opacity: 1; pointer-events: all; }
         
@@ -276,14 +318,9 @@
             position: relative; max-height: 90vh; overflow-y: auto; 
             background: var(--card-bg); padding: 20px; 
             border-radius: 24px 24px 0 0; width: 100%; 
-            
-            /* Плавный выезд снизу */
-            transform: translateY(100%);
-            transition: transform 0.3s cubic-bezier(0.25, 1, 0.5, 1);
+            transform: translateY(100%); transition: transform 0.3s cubic-bezier(0.25, 1, 0.5, 1);
         }
-        .modal-overlay.show .modal-content {
-            transform: translateY(0);
-        }
+        .modal-overlay.show .modal-content { transform: translateY(0); }
         
         .modal-close-btn {
             position: absolute; top: 15px; right: 15px;
@@ -308,7 +345,7 @@
 
         .skeleton-market { background: var(--card-bg); border-radius: 16px; padding: 15px; margin-bottom: 12px; height: 100px; animation: pulse 1.5s infinite; }
 
-        /* --- ШТОРКА ТРЕКА (BOTTOM SHEET) --- */
+        /* --- ШТОРКА ТРЕКА --- */
         .track-sheet-header { display: flex; gap: 15px; align-items: center; margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid rgba(255,255,255,0.1); }
         .track-sheet-cover { width: 60px; height: 60px; border-radius: 12px; object-fit: cover; background: #333; }
         .track-sheet-info { flex-grow: 1; overflow: hidden; }
@@ -363,14 +400,168 @@
             transition: background 0.2s; margin-bottom: 15px;
         }
         .trailer-btn:active { background: rgba(255,255,255,0.2); }
+
+        /* ========================================== */
+        /* ЖИВЫЕ КНОПКИ: ТАКТИЛЬНОСТЬ И ХОВЕР-ЭФФЕКТЫ */
+        /* ========================================== */
+
+        /* 1. Базовый плавный переход и фикс тач-задержки на мобилках */
+        .nav-item, .btn-search, .btn-create-pl, .premium-banner, 
+        .artist-card, .playlist-row-item, .btn-buy-market, 
+        .action-btn-modal, .sheet-action-btn, .btn-svg, .fp-btn, 
+        .fp-close, .modal-close-btn, .trailer-btn, .btn-back, 
+        .track-item, .market-card-wb, .icon-btn, .btn-levels {
+            transition: transform 0.15s cubic-bezier(0.175, 0.885, 0.32, 1.275), 
+                        filter 0.2s ease, 
+                        opacity 0.2s ease,
+                        background-color 0.2s ease,
+                        box-shadow 0.2s ease;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: manipulation; /* ВОТ ОНО: убирает задержку нажатия на телефонах */
+            cursor: pointer;
+        }
+
+        /* 2. Эффект нажатия (срабатывает мгновенно и на мобилках, и на ПК) */
+        .nav-item:active, .btn-search:active, .btn-create-pl:active, 
+        .premium-banner:active, .artist-card:active, .playlist-row-item:active, 
+        .btn-buy-market:active, .action-btn-modal:active, .sheet-action-btn:active, 
+        .btn-svg:active, .fp-btn:active, .fp-close:active, .modal-close-btn:active, 
+        .trailer-btn:active, .btn-back:active, .icon-btn:active, .track-item:active, 
+        .market-card-wb:active, .btn-levels:active,
+        .pressed { /* <--- ВОТ ЭТА СТРОКА */
+            transform: scale(0.94) !important; 
+            filter: brightness(0.75) !important; /* Чуть сильнее затемняем для сочности */
+        }
+
+        /* --- ПЛАВНОЕ ПОЯВЛЕНИЕ ЭЛЕМЕНТОВ --- */
+        @keyframes slideUpFade {
+            from { opacity: 0; transform: translateY(15px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .fade-in-item {
+            animation: slideUpFade 0.3s cubic-bezier(0.25, 0.8, 0.25, 1) forwards;
+            opacity: 0; 
+        }
+
+        /* --- ПЛАВНЫЙ АККОРДЕОН ДЛЯ УРОВНЕЙ --- */
+        #levels-container {
+            max-height: 0;
+            overflow: hidden;
+            opacity: 0;
+            padding-top: 0 !important;
+            padding-bottom: 0 !important;
+            margin-bottom: 0 !important;
+            border: none !important;
+            transition: max-height 0.4s ease-in-out, opacity 0.3s ease, padding 0.3s ease, margin 0.3s ease;
+        }
+        #levels-container.open {
+            max-height: 400px;
+            opacity: 1;
+            padding-top: 15px !important;
+            padding-bottom: 15px !important;
+            margin-bottom: 15px !important;
+        }
+
+        /* --- СТИЛИ ТАБЛИЦЫ УРОВНЕЙ --- */
+        .level-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 15px;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            color: var(--text-muted);
+            font-weight: 500;
+            transition: background 0.2s ease, color 0.2s ease;
+        }
+        .level-row:last-child {
+            border-bottom: none;
+        }
+        .level-row-left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .level-icon {
+            font-size: 18px;
+            width: 24px;
+            text-align: center;
+        }
+        .level-xp {
+            font-size: 11px;
+            opacity: 0.5;
+            margin-left: 2px;
+        }
+        .level-row-right {
+            font-weight: 800;
+            font-size: 16px;
+            color: white; /* Цифры всегда белые */
+            display: flex;
+            align-items: baseline;
+            gap: 4px;
+        }
+        .level-unit {
+            font-size: 10px; 
+            color: var(--text-muted); 
+            font-weight: 500;
+        }
+        
+        /* Красивое выделение для активного уровня (JS красит текст в синий) */
+        .level-row[style*="--blue"] {
+            background: rgba(0, 122, 255, 0.08);
+            border-radius: 12px;
+            border-bottom: none;
+            margin: 4px 8px; /* Чуть отступаем от краев */
+            padding: 10px 10px;
+        }
+
+        /* 3. Эффекты наведения (СРАБАТЫВАЮТ ТОЛЬКО НА ПК С МЫШКОЙ) */
+        @media (hover: hover) and (pointer: fine) {
+            /* Карточки чуть приподнимаются и подсвечиваются */
+            .playlist-row-item:hover, .market-card-wb:hover, .premium-banner:hover {
+                transform: translateY(-2px) scale(1.02);
+                box-shadow: 0 8px 25px rgba(0, 122, 255, 0.15);
+                filter: brightness(1.1);
+                border-color: rgba(255, 255, 255, 0.2);
+            }
+            
+            /* Для артистов наводим только на аватарку (как ты просил) */
+            .artist-card:hover .artist-avatar {
+                transform: scale(1.08);
+                border-color: var(--blue);
+                box-shadow: 0 0 15px rgba(0, 122, 255, 0.6);
+                filter: brightness(1.1);
+            }
+            
+            .track-item:hover { background: rgba(44, 44, 46, 0.9); }
+
+            /* Кнопки чуть светлеют */
+            .btn-search:hover, .btn-create-pl:hover, .btn-buy-market:hover, 
+            .action-btn-modal:hover, .sheet-action-btn:hover, .trailer-btn:hover {
+                filter: brightness(1.15);
+                transform: translateY(-1px);
+            }
+
+            /* Иконки (сердечки, три точки, навигация) */
+            .icon-btn:hover, .btn-svg:hover, .fp-btn:hover, .nav-item:hover {
+                color: white !important;
+                transform: scale(1.1);
+                filter: drop-shadow(0 0 5px rgba(255,255,255,0.3));
+            }
+            
+            .btn-play-pause:hover, .fp-btn-play:hover {
+                transform: scale(1.05);
+                box-shadow: 0 0 15px rgba(255, 255, 255, 0.4);
+            }
+        }
     </style>
 </head>
-<body>
+<body ontouchstart="">
 
     <div id="toast-container"></div>
 
     <div id="tab-profile" class="tab-content">
-        <div class="header-title">Профиль <span>⚙️</span></div>
+        <div class="header-title">Профиль</div>
         
         <div class="profile-header">
             <div class="avatar-container" onclick="openStats()">
@@ -395,13 +586,33 @@
             <button class="btn-levels" onclick="toggleLevels()">ℹ Уровни и привилегии</button>
         </div>
 
-        <div id="levels-container" style="display: none; background: var(--card-bg); border-radius: 16px; padding: 15px; margin-bottom: 15px; font-size: 13px;">
-             <div style="margin-bottom: 10px; opacity: 0.8; text-align: center;">Лимит скачиваний в день</div>
-             <div style="display: flex; justify-content: space-between; padding: 5px 0; color: var(--text-muted);" id="lvl-Новичок">🥉 Новичок (0+) <span>3</span></div>
-             <div style="display: flex; justify-content: space-between; padding: 5px 0; color: var(--text-muted);" id="lvl-Коллекционер">🥈 Коллекционер (201+) <span>5</span></div>
-             <div style="display: flex; justify-content: space-between; padding: 5px 0; color: var(--text-muted);" id="lvl-Куратор">🥇 Куратор (601+) <span>10</span></div>
-             <div style="display: flex; justify-content: space-between; padding: 5px 0; color: var(--text-muted);" id="lvl-Легенда">💎 Легенда (1501+) <span>20</span></div>
-             <div style="display: flex; justify-content: space-between; padding: 5px 0; color: var(--text-muted);" id="lvl-Меценат">👑 Меценат (3000+) <span>50</span></div>
+        <div id="levels-container" style="background: var(--card-bg); border-radius: 16px; font-size: 14px;">
+             <div style="font-size: 12px; color: var(--text-muted); text-align: center; margin-bottom: 15px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px;">Уровни и Лимиты</div>
+             
+             <div class="level-row" id="lvl-Новичок">
+                 <div class="level-row-left"><span class="level-icon">🥉</span> <span>Новичок</span> <span class="level-xp">(0+)</span></div>
+                 <div class="level-row-right"><span>3</span> <span class="level-unit">трека</span></div>
+             </div>
+             
+             <div class="level-row" id="lvl-Коллекционер">
+                 <div class="level-row-left"><span class="level-icon">🥈</span> <span>Коллекционер</span> <span class="level-xp">(201+)</span></div>
+                 <div class="level-row-right"><span>5</span> <span class="level-unit">треков</span></div>
+             </div>
+             
+             <div class="level-row" id="lvl-Куратор">
+                 <div class="level-row-left"><span class="level-icon">🥇</span> <span>Куратор</span> <span class="level-xp">(601+)</span></div>
+                 <div class="level-row-right"><span>10</span> <span class="level-unit">треков</span></div>
+             </div>
+             
+             <div class="level-row" id="lvl-Легенда">
+                 <div class="level-row-left"><span class="level-icon">💎</span> <span>Легенда</span> <span class="level-xp">(1501+)</span></div>
+                 <div class="level-row-right"><span>20</span> <span class="level-unit">треков</span></div>
+             </div>
+             
+             <div class="level-row" id="lvl-Меценат">
+                 <div class="level-row-left"><span class="level-icon">👑</span> <span>Меценат</span> <span class="level-xp">(3000+)</span></div>
+                 <div class="level-row-right"><span>50</span> <span class="level-unit">треков</span></div>
+             </div>
         </div>
 
         <div id="premium-status"></div>
@@ -431,8 +642,26 @@
             </div>
             <button class="btn-search" onclick="searchMusic()">Найти</button>
         </div>
-        <div id="similar-artists-container" class="similar-artists"></div>
-        <div id="search-results" class="track-list"></div>
+        
+        <div id="trending-container">
+            <h3 style="font-size: 16px; margin-bottom: 15px; color: var(--text-muted);">🔥 Сейчас в тренде</h3>
+            <div id="trending-list" class="artist-grid"></div>
+        </div>
+
+        <div id="artist-profile-container" style="display: none;">
+            <button class="btn-back" onclick="closeArtistProfile()">← Назад</button>
+            <div class="artist-header">
+                <img src="" id="artist-profile-img">
+                <h2 id="artist-profile-name"></h2>
+                <p id="artist-profile-stats"></p>
+            </div>
+            <div id="artist-tracks-list" class="track-list"></div>
+        </div>
+
+        <div id="search-results-container">
+            <div id="similar-artists-container" class="artist-scroll" style="margin-bottom: 15px;"></div>
+            <div id="search-results" class="track-list"></div>
+        </div>
     </div>
 
     <div id="tab-playlists" class="tab-content">
@@ -447,8 +676,8 @@
     </div>
 
     <div id="tab-market" class="tab-content">
-        <div class="header-title">Маркетплейс <span>🛒</span></div>
-        <div id="market-list"></div>
+        <div class="header-title">Маркетплейс</div>
+        <div id="market-list" class="market-grid"></div>
     </div>
 
     <div id="player-bar" class="player-bar" onclick="openFullPlayer(event)">
@@ -475,6 +704,10 @@
                 
                 <button class="btn-svg" onclick="playNextTrack()">
                     <svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+                </button>
+
+                <button class="player-close-btn" onclick="closePlayer(event)" title="Закрыть плеер">
+                    <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
                 </button>
             </div>
         </div>
@@ -569,7 +802,6 @@
         </div>
     </div>
 
-    <!-- Модальное окно действий (плейлисты) -->
     <div id="action-modal" class="modal-overlay" onclick="closeActionModal(event)">
         <div class="modal-content" onclick="event.stopPropagation()">
             <button class="modal-close-btn" onclick="closeActionModal()">
@@ -581,7 +813,6 @@
         </div>
     </div>
 
-    <!-- Модальное окно статистики -->
     <div id="stats-modal" class="modal-overlay" onclick="closeStats(event)">
         <div class="modal-content" onclick="event.stopPropagation()">
             <button class="modal-close-btn" onclick="closeStats()">
@@ -593,7 +824,17 @@
         </div>
     </div>
 
-    <!-- Шторка действий с треком (Яндекс-стайл) -->
+    <div id="playlist-picker-modal" class="modal-overlay" onclick="closePlaylistModal(event)">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <button class="modal-close-btn" onclick="closePlaylistModal()">
+                <svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"></path></svg>
+            </button>
+            <div style="width: 40px; height: 4px; background: #3a3a3c; border-radius: 2px; margin: 0 auto 15px auto;"></div>
+            <h3 style="margin-top:0; text-align: center; margin-bottom: 15px;">Куда добавить трек?</h3>
+            <div id="playlist-picker-list" class="track-list"></div>
+        </div>
+    </div>
+
     <div id="track-sheet-modal" class="modal-overlay" onclick="closeTrackSheet(event)">
         <div class="modal-content" onclick="event.stopPropagation()">
             <button class="modal-close-btn" onclick="closeTrackSheet()">
@@ -625,6 +866,9 @@
             </div>
 
             <div class="action-menu">
+                <button class="action-btn-modal" onclick="addToPlaylistFromSheet()">
+                    <svg viewBox="0 0 24 24" style="width:20px; fill:white;"><path d="M14 10H2v2h12v-2zm0-4H2v2h12V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM2 16h8v-2H2v2z"/></svg> Добавить в плейлист
+                </button>
                 <button class="action-btn-modal" onclick="playNextFromSheet()">
                     <svg viewBox="0 0 24 24" style="width:20px; fill:white;"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg> Играть следующим
                 </button>
@@ -656,13 +900,14 @@
         let isPlaying = false;
         let userLikes = new Set(); 
 
-        // Переменные для шторки трека
         let currentSheetTrack = null;
         let currentSheetPlaylistId = null;
+        let trackIdToAddToPlaylist = null;
 
-        // --- СОСТОЯНИЕ ПЛЕЕРА ---
         let isShuffle = false;
         let repeatMode = 'none';
+        window.trendingArtists = [];
+        window.currentArtistTracks = [];
 
         async function apiFetch(url, options = {}) {
             const headers = { ...options.headers, 'Authorization': `TWA ${tg.initData}` };
@@ -776,6 +1021,10 @@
             
             if (tabName === 'playlists') loadPlaylists();
             if (tabName === 'market') loadMarket();
+            
+            if (tabName === 'search') {
+                closeArtistProfile();
+            }
         }
 
         async function fetchProfile() {
@@ -834,7 +1083,7 @@
 
         function toggleLevels() {
             const el = document.getElementById('levels-container');
-            el.style.display = el.style.display === 'none' ? 'block' : 'none';
+            el.classList.toggle('open');
         }
 
         async function buyPremium() {
@@ -895,9 +1144,113 @@
             toggleLike(audioQueue[currentAudioIndex].id, null);
         }
 
+        // --- ТРЕНДЫ (АРТИСТЫ) ---
+        async function loadTrending() {
+            const trendingDiv = document.getElementById('trending-list');
+            try {
+                const response = await apiFetch('/api/trending_artists');
+                const data = await response.json();
+
+                if (data.error || !data.artists || data.artists.length === 0) {
+                    document.getElementById('trending-container').style.display = 'none';
+                    return;
+                }
+
+                window.trendingArtists = data.artists;
+
+                let html = '';
+                data.artists.forEach((artist, index) => {
+                    html += `
+                        <div class="artist-card fade-in-item" onclick="viewArtist('${escapeHTML(artist.artist)}', ${artist.top_track_id})">
+                            <img src="/api/cover/${artist.top_track_id}" class="artist-avatar" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
+                            <div class="artist-name">${escapeHTML(artist.artist)}</div>
+                        </div>
+                    `;
+                });
+                trendingDiv.innerHTML = html;
+            } catch(e) {
+                document.getElementById('trending-container').style.display = 'none';
+            }
+        }
+
+        async function viewArtist(artistName, coverId) {
+            document.getElementById('trending-container').style.display = 'none';
+            document.getElementById('search-results-container').style.display = 'none';
+            document.getElementById('artist-profile-container').style.display = 'block';
+            
+            document.getElementById('artist-profile-img').src = `/api/cover/${coverId}`;
+            document.getElementById('artist-profile-name').innerText = artistName;
+            document.getElementById('artist-profile-stats').innerText = "Загрузка треков...";
+            
+            const trackList = document.getElementById('artist-tracks-list');
+            trackList.innerHTML = Array(3).fill(`
+                <div class="skeleton-item">
+                    <div class="skeleton-box skeleton-cover"></div>
+                    <div class="skeleton-info"><div class="skeleton-box skeleton-line"></div><div class="skeleton-box skeleton-line short"></div></div>
+                </div>
+            `).join('');
+
+            try {
+                const response = await apiFetch(`/api/artist_tracks?artist=${encodeURIComponent(artistName)}`);
+                const data = await response.json();
+                
+                if (data.error || data.tracks.length === 0) {
+                    trackList.innerHTML = '<p style="text-align:center; color:var(--text-muted);">У этого артиста пока нет треков в базе.</p>';
+                    return;
+                }
+                
+                window.currentArtistTracks = data.tracks;
+                document.getElementById('artist-profile-stats').innerText = `${data.tracks.length} треков в базе`;
+                
+                let html = '';
+                data.tracks.forEach((track, index) => {
+                    if (track.is_liked) userLikes.add(track.id);
+                    const likedClass = userLikes.has(track.id) ? 'liked' : '';
+                    html += `
+                        <div class="track-item fade-in-item" onclick="playFromArtist(${index})">
+                            <img src="/api/cover/${track.id}" class="track-cover" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
+                            <div class="track-info">
+                                <div class="track-title">${escapeHTML(track.title)}</div>
+                                <div class="track-artist">${escapeHTML(track.artist)}</div>
+                                <div class="track-badge">⭐ ${escapeHTML(track.quality)}</div>
+                            </div>
+                            <div class="track-actions">
+                                <button class="icon-btn ${likedClass}" onclick="event.stopPropagation(); toggleLike(${track.id}, this)">
+                                    <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+                                </button>
+                                <button class="icon-btn" onclick="event.stopPropagation(); openTrackSheet(${index}, null, 'artist')" title="Действия">
+                                    <svg viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                });
+                trackList.innerHTML = html;
+            } catch(e) {
+                trackList.innerHTML = '<p style="text-align:center; color:var(--red);">Ошибка загрузки треков.</p>';
+            }
+        }
+
+        function closeArtistProfile() {
+            document.getElementById('artist-profile-container').style.display = 'none';
+            document.getElementById('search-results-container').style.display = 'block';
+            document.getElementById('trending-container').style.display = 'block';
+        }
+
+        function playFromArtist(index) {
+            audioQueue = window.currentArtistTracks;
+            currentAudioIndex = index;
+            playCurrentTrack();
+        }
+
+        // --- ПОИСК ---
         async function searchMusic() {
             const query = document.getElementById('search-input').value.trim();
             if (!query) return;
+
+            document.getElementById('trending-container').style.display = 'none';
+            document.getElementById('artist-profile-container').style.display = 'none';
+            document.getElementById('search-results-container').style.display = 'block';
             
             const resultsDiv = document.getElementById('search-results');
             resultsDiv.innerHTML = Array(3).fill(`
@@ -908,7 +1261,6 @@
                 </div>
             `).join('');
             
-            // Сбрасываем старые рекомендации при новом поиске
             document.getElementById('similar-artists-container').innerHTML = '';
 
             const response = await apiFetch(`/api/search?q=${encodeURIComponent(query)}`);
@@ -916,6 +1268,7 @@
 
             if (data.error || data.tracks.length === 0) {
                 resultsDiv.innerHTML = '<p style="text-align:center; color:var(--text-muted);">Ничего не найдено 😔</p>';
+                document.getElementById('trending-container').style.display = 'block';
                 return;
             }
 
@@ -927,7 +1280,7 @@
                 if (track.is_liked) userLikes.add(track.id);
                 const likedClass = userLikes.has(track.id) ? 'liked' : '';
                 html += `
-                    <div class="track-item" onclick="playFromList(${index})">
+                    <div class="track-item fade-in-item" onclick="playFromList(${index})">
                         <img src="/api/cover/${track.id}" class="track-cover" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
                         <div class="track-info">
                             <div class="track-title">${escapeHTML(track.title)}</div>
@@ -938,7 +1291,7 @@
                             <button class="icon-btn ${likedClass}" onclick="event.stopPropagation(); toggleLike(${track.id}, this)">
                                 <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
                             </button>
-                            <button class="icon-btn" onclick="event.stopPropagation(); openTrackSheet(${index}, null)" title="Действия">
+                            <button class="icon-btn" onclick="event.stopPropagation(); openTrackSheet(${index}, null, 'search')" title="Действия">
                                 <svg viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
                             </button>
                         </div>
@@ -947,12 +1300,11 @@
             });
             resultsDiv.innerHTML = html;
 
-            // Рендерим похожих исполнителей
             const similarDiv = document.getElementById('similar-artists-container');
             if (data.similar_artists && data.similar_artists.length > 0) {
                 let similarHtml = '<span style="font-size:12px; color:var(--text-muted); width:100%; margin-bottom:5px;">Похожие исполнители:</span>';
                 data.similar_artists.forEach(artist => {
-                    similarHtml += `<button class="artist-chip" onclick="searchByArtist('${escapeHTML(artist)}')">${escapeHTML(artist)}</button>`;
+                    similarHtml += `<button class="artist-chip" style="background:var(--card-hover); color:white; border:none; padding:6px 12px; border-radius:20px; font-size:13px;" onclick="viewArtist('${escapeHTML(artist)}', 0)">${escapeHTML(artist)}</button>`;
                 });
                 similarDiv.innerHTML = similarHtml;
             } else {
@@ -960,13 +1312,18 @@
             }
         }
 
-        function searchByArtist(artistName) {
-            document.getElementById('search-input').value = artistName;
-            searchMusic();
+        function playFromList(index) {
+            audioQueue = window.currentDisplayList;
+            currentAudioIndex = index;
+            playCurrentTrack();
         }
 
-        function openTrackSheet(index, playlistId) {
-            const track = window.currentDisplayList[index];
+        function openTrackSheet(index, playlistId, contextType) {
+            let track;
+            if (contextType === 'artist') track = window.currentArtistTracks[index];
+            else if (contextType === 'trending') track = window.trendingList[index];
+            else track = window.currentDisplayList[index];
+            
             if (!track) return;
             
             currentSheetTrack = track;
@@ -1043,11 +1400,84 @@
             closeTrackSheet();
         }
 
+        function addToPlaylistFromSheet() {
+            if (!currentSheetTrack) return;
+            const trackId = currentSheetTrack.id;
+            closeTrackSheet();
+            openPlaylistModal(trackId);
+        }
+
         function addToQueueFromSheet() {
             if (!currentSheetTrack) return;
             audioQueue.push(currentSheetTrack);
             showToast("Трек добавлен в очередь");
             closeTrackSheet();
+        }
+
+        async function openPlaylistModal(trackId) {
+            trackIdToAddToPlaylist = trackId;
+            const listDiv = document.getElementById('playlist-picker-list');
+            listDiv.innerHTML = '<p style="text-align:center; color:var(--text-muted);">Загрузка...</p>';
+            document.getElementById('playlist-picker-modal').classList.add('show');
+
+            try {
+                const response = await apiFetch(`/api/playlists?exclude_track_id=${trackId}`);
+                const data = await response.json();
+
+                if (data.error || !data.playlists || data.playlists.length === 0) {
+                    listDiv.innerHTML = '<p style="text-align:center; color:var(--text-muted);">У вас нет подходящих плейлистов. Создайте новый во вкладке «Плейлисты».</p>';
+                    return;
+                }
+
+                const editable = data.playlists.filter(pl => !pl.original_playlist_id);
+                if (editable.length === 0) {
+                    listDiv.innerHTML = '<p style="text-align:center; color:var(--text-muted);">Нет своих плейлистов для добавления.</p>';
+                    return;
+                }
+
+                let html = '';
+                editable.forEach(pl => {
+                    html += `
+                        <div class="playlist-row-item fade-in-item" onclick="addTrackToPlaylist(${pl.id})">
+                            <img src="/api/stream_playlist_cover/${pl.id}" class="playlist-row-cover" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
+                            <div style="flex-grow:1; overflow:hidden;">
+                                <div style="font-weight:600; font-size:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHTML(pl.title)}</div>
+                                <div style="font-size:12px; color:var(--text-muted);">${pl.track_count} треков</div>
+                            </div>
+                        </div>
+                    `;
+                });
+                listDiv.innerHTML = html;
+            } catch(e) {
+                listDiv.innerHTML = '<p style="text-align:center; color:var(--red);">Ошибка загрузки плейлистов.</p>';
+            }
+        }
+
+        function closePlaylistModal(e) {
+            if(e && e.target !== document.getElementById('playlist-picker-modal')) return;
+            document.getElementById('playlist-picker-modal').classList.remove('show');
+            trackIdToAddToPlaylist = null;
+        }
+
+        async function addTrackToPlaylist(playlistId) {
+            if (!trackIdToAddToPlaylist) return;
+            try {
+                const response = await apiFetch(`/api/playlists/${playlistId}/add`, { 
+                    method: 'POST', 
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ track_id: trackIdToAddToPlaylist }) 
+                });
+                const data = await response.json();
+
+                if (data.error) {
+                    showToast(data.error, true);
+                } else {
+                    showToast("Трек добавлен в плейлист");
+                    closePlaylistModal();
+                }
+            } catch(e) {
+                showToast("Ошибка сети", true);
+            }
         }
 
         async function deleteFromPlaylistFromSheet() {
@@ -1098,12 +1528,6 @@
             }
         }
 
-        function playFromList(index) {
-            audioQueue = window.currentDisplayList;
-            currentAudioIndex = index;
-            playCurrentTrack();
-        }
-
         function toggleShuffle() {
             isShuffle = !isShuffle;
             const btn = document.getElementById('fp-shuffle-btn');
@@ -1127,14 +1551,13 @@
             }
         }
 
-        function playCurrentTrack() {
+        async function playCurrentTrack() {
             if (audioQueue.length === 0 || currentAudioIndex >= audioQueue.length) return;
             const track = audioQueue[currentAudioIndex];
             
             const playerBar = document.getElementById('player-bar');
             const audio = document.getElementById('audio-element');
             
-            // Если это трейлер, используем заглушку вместо обложки
             let coverUrl = track.is_trailer ? 'https://cdn-icons-png.flaticon.com/512/3844/3844724.png' : `/api/cover/${track.id}`;
             
             playerBar.classList.add('show');
@@ -1153,17 +1576,34 @@
             document.getElementById('fp-cover').onerror = function() { this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png' };
             document.getElementById('fp-bg').style.backgroundImage = `url('${coverUrl}')`;
             
-            // Если это трейлер, убираем сердечко, иначе ставим нужное состояние
             if (track.is_trailer) {
                 document.getElementById('mini-like-btn').classList.remove('liked');
                 document.getElementById('fp-like-btn').classList.remove('liked');
                 audio.src = `/api/stream_trailer/${track.playlist_id}`;
+                audio.play();
             } else {
                 updatePlayerLikeButtons(track.id);
-                audio.src = `/api/stream/${track.id}`;
+                
+                try {
+                    const res = await apiFetch(`/api/get_stream_url/${track.id}`);
+                    const data = await res.json();
+                    
+                    if (data.url) {
+                        audio.src = data.url;
+                        audio.play();
+                    } else {
+                        showToast(data.error || "Ошибка получения ссылки", true);
+                        isPlaying = false;
+                        updatePlayPauseIcons();
+                        return;
+                    }
+                } catch (e) {
+                    showToast("Ошибка сети при запросе трека", true);
+                    isPlaying = false;
+                    updatePlayPauseIcons();
+                    return;
+                }
             }
-            
-            audio.play();
 
             if ('mediaSession' in navigator) {
                 navigator.mediaSession.metadata = new MediaMetadata({
@@ -1179,8 +1619,15 @@
         }
 
         function playPrevTrack() {
-            if (currentAudioIndex > 0) { currentAudioIndex--; playCurrentTrack(); }
-            else showToast("Это первый трек в очереди", true);
+            const audio = document.getElementById('audio-element');
+            if (currentAudioIndex > 0) { 
+                currentAudioIndex--; 
+                playCurrentTrack(); 
+            } else if (audio) {
+                // Если это первый трек, перематываем в начало
+                audio.currentTime = 0; 
+                audio.play();
+            }
         }
 
         function playNextTrack() {
@@ -1212,6 +1659,33 @@
                     currentAudioIndex = audioQueue.length - 1;
                     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
                 }
+            }
+        }
+
+        function closePlayer(event) {
+            if(event) event.stopPropagation(); // Чтобы не открылся полноэкранный плеер при клике на крестик
+            
+            const audio = document.getElementById('audio-element');
+            const playerBar = document.getElementById('player-bar');
+            
+            // Останавливаем и сбрасываем аудио
+            audio.pause();
+            audio.src = '';
+            audio.currentTime = 0;
+            
+            // Скрываем мини-плеер и закрываем полноэкранный (если открыт)
+            playerBar.classList.remove('show');
+            closeFullPlayer();
+            
+            // Очищаем очередь
+            audioQueue = [];
+            currentAudioIndex = 0;
+            isPlaying = false;
+            
+            // Сбрасываем Media Session
+            if ('mediaSession' in navigator) {
+                navigator.mediaSession.playbackState = 'none';
+                navigator.mediaSession.metadata = null;
             }
         }
 
@@ -1292,13 +1766,11 @@
             listDiv.innerHTML = Array(3).fill(`<div class="skeleton-market"></div>`).join('');
             
             let html = `
-                <div class="market-item" onclick="viewLikedTracks()">
-                    <div class="market-header">
-                        <div class="folder-icon red">❤️</div>
-                        <div class="market-info">
-                            <div class="market-title">Мне нравится</div>
-                            <div class="market-sub">Твоя золотая полка</div>
-                        </div>
+                <div class="playlist-row-item" onclick="viewLikedTracks()">
+                    <div class="folder-icon red" style="width:64px; height:64px; border-radius:12px; background:linear-gradient(135deg, #ff0844, #ffb199); display:flex; justify-content:center; align-items:center; font-size:28px; flex-shrink:0;">❤️</div>
+                    <div class="market-info" style="flex-grow:1;">
+                        <div class="market-title" style="font-weight:600; font-size:16px;">Мне нравится</div>
+                        <div class="market-sub" style="font-size:13px; color:var(--text-muted);">Твоя золотая полка</div>
                     </div>
                 </div>
             `;
@@ -1322,18 +1794,16 @@
                 const isBought = pl.original_playlist_id ? true : false;
                 
                 html += `
-                    <div class="market-item" onclick='viewPlaylist(${pl.id}, ${JSON.stringify(pl.title)}, ${pl.sales_count})'>
-                        <div class="market-header">
-                            <img src="/api/stream_playlist_cover/${pl.id}" class="playlist-cover" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
-                            <div class="market-info">
-                                <div class="market-title">${escapeHTML(pl.title)}</div>
-                                <div class="market-sub">${subText}${onSale}</div>
-                            </div>
-                            <button class="icon-btn share" onclick='event.stopPropagation(); sharePlaylist(${pl.id})' title="Поделиться">
-                                <svg viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92 1.61 0 2.92-1.31 2.92-2.92s-1.31-2.92-2.92-2.92z"/></svg>
-                            </button>
-                            <button class="action-btn" style="background:var(--card-hover); width:36px; height:36px; border-radius:50%; padding:0; font-size:16px;" onclick='event.stopPropagation(); openActionModal(${pl.id}, ${JSON.stringify(pl.title)}, ${pl.is_public && pl.price > 0}, ${isBought})'>⋮</button>
+                    <div class="playlist-row-item" onclick='viewPlaylist(${pl.id}, ${JSON.stringify(pl.title)}, ${pl.sales_count})'>
+                        <img src="/api/stream_playlist_cover/${pl.id}" class="playlist-row-cover" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
+                        <div class="market-info" style="flex-grow:1; overflow:hidden;">
+                            <div class="market-title" style="font-weight:600; font-size:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHTML(pl.title)}</div>
+                            <div class="market-sub" style="font-size:12px; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${subText}${onSale}</div>
                         </div>
+                        <button class="icon-btn share" style="flex-shrink:0;" onclick='event.stopPropagation(); sharePlaylist(${pl.id})' title="Поделиться">
+                            <svg viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92 1.61 0 2.92-1.31 2.92-2.92s-1.31-2.92-2.92-2.92z"/></svg>
+                        </button>
+                        <button class="action-btn" style="flex-shrink:0; background:var(--card-hover); width:36px; height:36px; border-radius:50%; padding:0; font-size:16px;" onclick='event.stopPropagation(); openActionModal(${pl.id}, ${JSON.stringify(pl.title)}, ${pl.is_public && pl.price > 0}, ${isBought})'>⋮</button>
                     </div>
                 `;
             });
@@ -1357,7 +1827,7 @@
                 data.tracks.forEach((track, index) => {
                     const quality = track.quality_status !== 'none' ? track.quality_status : 'Verified';
                     html += `
-                        <div class="track-item" onclick="playFromList(${index})">
+                        <div class="track-item fade-in-item" onclick="playFromList(${index})">
                             <img src="/api/cover/${track.id}" class="track-cover" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
                             <div class="track-info">
                                 <div class="track-title">${escapeHTML(track.title)}</div>
@@ -1368,7 +1838,7 @@
                                 <button class="icon-btn liked" onclick="event.stopPropagation(); toggleLike(${track.id}, this)">
                                     <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
                                 </button>
-                                <button class="icon-btn" onclick="event.stopPropagation(); openTrackSheet(${index}, null)" title="Действия">
+                                <button class="icon-btn" onclick="event.stopPropagation(); openTrackSheet(${index}, null, 'likes')" title="Действия">
                                     <svg viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
                                 </button>
                             </div>
@@ -1462,7 +1932,6 @@
         async function viewPlaylist(playlistId, title, salesCount) {
             const listDiv = document.getElementById('playlists-list');
 
-            // Сначала загружаем треки и инфу о плейлисте
             const response = await apiFetch(`/api/playlists/${playlistId}`);
             const data = await response.json();
             window.currentDisplayList = data.tracks; 
@@ -1474,7 +1943,6 @@
             if (currentPl && currentPl.trailer_path) {
                 trailerHtml = `<button class="trailer-btn" onclick='playTrailer(${playlistId}, ${JSON.stringify(title)})'>▶ Послушать трейлер</button>`;
             } else if (currentPl && user && String(user.id) === '1778878276') {
-                // Только для админа
                 trailerHtml = `<button class="trailer-btn" onclick="requestTrailer(${playlistId})">🎵 Добавить трейлер</button>`;
             }
 
@@ -1501,7 +1969,7 @@
                     const quality = track.quality_status !== 'none' ? track.quality_status : 'Verified';
                     const isLiked = userLikes.has(track.id) ? 'liked' : '';
                     html += `
-                        <div class="track-item" onclick="playFromList(${index})">
+                        <div class="track-item fade-in-item" onclick="playFromList(${index})">
                             <img src="/api/cover/${track.id}" class="track-cover" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
                             <div class="track-info">
                                 <div class="track-title">${escapeHTML(track.title)}</div>
@@ -1512,7 +1980,7 @@
                                 <button class="icon-btn ${isLiked}" onclick="event.stopPropagation(); toggleLike(${track.id}, this)">
                                     <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
                                 </button>
-                                <button class="icon-btn" onclick="event.stopPropagation(); openTrackSheet(${index}, ${playlistId})" title="Действия">
+                                <button class="icon-btn" onclick="event.stopPropagation(); openTrackSheet(${index}, ${playlistId}, 'playlist')" title="Действия">
                                     <svg viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
                                 </button>
                             </div>
@@ -1525,13 +1993,13 @@
 
         async function loadMarket() {
             const listDiv = document.getElementById('market-list');
-            listDiv.innerHTML = Array(3).fill(`<div class="skeleton-market"></div>`).join('');
+            listDiv.innerHTML = Array(4).fill(`<div class="skeleton-market"></div>`).join('');
             
             const response = await apiFetch('/api/market');
             const data = await response.json();
 
             if (data.error || data.playlists.length === 0) {
-                listDiv.innerHTML = '<p style="text-align:center; color:var(--text-muted);">Пока нет плейлистов на продажу.</p>';
+                listDiv.innerHTML = '<p style="text-align:center; color:var(--text-muted); grid-column: span 2;">Пока нет плейлистов на продажу.</p>';
                 return;
             }
 
@@ -1539,24 +2007,24 @@
             data.playlists.forEach((pl, i) => {
                 const sellerName = pl.username ? `@${escapeHTML(pl.username)}` : `ID ${pl.seller_tg}`;
                 const isMyOwn = user && pl.seller_tg === user.id;
-                const colors = ['', 'purple', 'orange', 'teal'];
-                const colorClass = colors[i % colors.length];
 
                 const btnHtml = isMyOwn 
                     ? `<button class="btn-buy-market" disabled>Ваш плейлист</button>`
                     : `<button class="btn-buy-market" onclick="buyMarketPlaylist(${pl.id}, ${pl.price})">Купить</button>`;
 
                 html += `
-                    <div class="market-item">
-                        <div class="market-header">
-                            <img src="/api/stream_playlist_cover/${pl.id}" class="playlist-cover" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
-                            <div class="market-info">
-                                <div class="market-title">${escapeHTML(pl.title)}</div>
-                                <div class="market-sub">${pl.track_count} трека • ${sellerName}</div>
-                                <div class="market-price">🪙 ${pl.price} поинтов</div>
+                    <div class="market-card-wb fade-in-item" onclick="${isMyOwn ? '' : `buyMarketPlaylist(${pl.id}, ${pl.price})`}">
+                        <img src="/api/stream_playlist_cover/${pl.id}" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
+                        <div class="market-card-wb-info">
+                            <div class="market-card-wb-price">🪙 ${pl.price}</div>
+                            <div class="market-card-wb-title">${escapeHTML(pl.title)}</div>
+                            <div class="market-card-wb-seller">${sellerName}</div>
+                            <div class="market-card-wb-stats">
+                                <span>🎵 ${pl.track_count} треков</span>
+                                <span>🛒 ${pl.sales_count} продаж</span>
                             </div>
+                            ${btnHtml}
                         </div>
-                        ${btnHtml}
                     </div>
                 `;
             });
@@ -1572,41 +2040,6 @@
             else showToast(data.msg, true);
         }
 
-        async function openPlaylistModal(trackId) {
-            currentTrackIdToAdd = trackId;
-            const modal = document.getElementById('action-modal');
-            const listDiv = document.getElementById('action-buttons');
-            document.getElementById('action-title').innerText = "Куда добавить?";
-            listDiv.innerHTML = 'Загрузка...';
-            modal.classList.add('show');
-
-            const response = await apiFetch('/api/playlists');
-            const data = await response.json();
-
-            if (data.error || data.playlists.length === 0) {
-                listDiv.innerHTML = '<p style="color:var(--text-muted); text-align:center;">У вас нет плейлистов.</p>';
-                return;
-            }
-
-            let html = '';
-            data.playlists.forEach(pl => {
-                html += `<button class="action-btn-modal" onclick='confirmAddToPlaylist(${pl.id})'>📂 ${escapeHTML(pl.title)}</button>`;
-            });
-            listDiv.innerHTML = html;
-        }
-
-        async function confirmAddToPlaylist(playlistId) {
-            if (!currentTrackIdToAdd) return;
-            const response = await apiFetch(`/api/playlists/${playlistId}/add`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ track_id: currentTrackIdToAdd })
-            });
-            const data = await response.json();
-            closeActionModal();
-            if (data.error) showToast(data.error, true);
-            else showToast(data.msg);
-        }
-
-        // --- ЛОГИКА ТРЕЙЛЕРОВ ---
         let trailerAudio = null;
 
         async function requestTrailer(playlistId) {
@@ -1629,7 +2062,6 @@
                 trailerAudio = null;
             }
             
-            // Создаем фейковый объект трека для плеера
             const fakeTrack = {
                 id: `trailer_${playlistId}`,
                 title: `Трейлер: ${playlistTitle}`,
@@ -1638,16 +2070,35 @@
                 playlist_id: playlistId
             };
             
-            // Запускаем его через основной плеер
             audioQueue = [fakeTrack];
             currentAudioIndex = 0;
             playCurrentTrack();
         }
 
+        // --- ТАКТИЛЬНОСТЬ ДЛЯ МОБИЛЬНЫХ УСТРОЙСТВ (ИСПРАВЛЕНИЕ iOS) ---
+        const touchElements = '.nav-item, .btn-search, .btn-create-pl, .premium-banner, .artist-card, .playlist-row-item, .btn-buy-market, .action-btn-modal, .sheet-action-btn, .btn-svg, .fp-btn, .fp-close, .modal-close-btn, .trailer-btn, .btn-back, .track-item, .market-card-wb, .icon-btn, .btn-levels';
+        
+        document.addEventListener('touchstart', (e) => {
+            const el = e.target.closest(touchElements);
+            if (el) el.classList.add('pressed');
+        }, { passive: true });
+
+        document.addEventListener('touchend', (e) => {
+            const el = e.target.closest(touchElements);
+            if (el) el.classList.remove('pressed');
+        }, { passive: true });
+        
+        document.addEventListener('touchcancel', (e) => {
+            const el = e.target.closest(touchElements);
+            if (el) el.classList.remove('pressed');
+        }, { passive: true });
+        // -------------------------------------------------------------
+
         // Запуск
         initLikes();
         fetchProfile();
         handleStartParam();
+        loadTrending();
     </script>
 </body>
 </html>

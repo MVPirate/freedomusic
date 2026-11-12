@@ -14,6 +14,9 @@ VK_TOKEN: str = os.getenv("VK_TOKEN", "").strip()
 VK_USER_ID: str = os.getenv("VK_USER_ID", "").strip()
 ADMIN_ID: int = int(os.getenv("ADMIN_ID", "0"))
 
+# Добавь вот эту строку:
+STREAM_SECRET_KEY: str = os.getenv("STREAM_SECRET_KEY", TELEGRAM_BOT_TOKEN).strip()
+
 
 def validate_config() -> None:
     """Проверяет, что ОБЯЗАТЕЛЬНЫЕ токены заданы."""

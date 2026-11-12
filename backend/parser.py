@@ -1,4 +1,4 @@
-"""Парсер плейлистов FreeDom Music Bot: VK, Яндекс.Музыка, Spotify."""
+"""Парсер плейлистов FreeDom Music Bot: VK, Яндекс.Музыка, Spotify, SoundCloud."""
 from __future__ import annotations
 
 import os
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-SourceType = Literal["vk", "yandex", "spotify"]
+SourceType = Literal["vk", "yandex", "spotify", "soundcloud"]
 TrackDict = Dict[str, str]
 
 _yandex_client = None
@@ -89,11 +89,12 @@ def _spotify_id(url: str) -> Optional[str]:
 
 def detect_source(url: str) -> SourceType:
     try:
+        if "soundcloud.com" in url: return "soundcloud"
         if _vk_ids(url) is not None: return "vk"
         if _yandex_target(url) is not None: return "yandex"
         if _spotify_id(url) is not None: return "spotify"
     except ValueError: pass
-    raise ValueError(f"Невалидная ссылка на плейлист: {url!r}. Ожидается VK, Яндекс.Музыка или Spotify.")
+    raise ValueError(f"Невалидная ссылка на плейлист: {url!r}. Ожидается VK, Яндекс.Музыка, Spotify или SoundCloud.")
 
 def _track(title: str, artist: str, duration: int = 0) -> TrackDict:
     return {"title": (title or "").strip(), "artist": (artist or "").strip(), "duration": duration}
@@ -236,4 +237,76 @@ def parse_playlist(url: str) -> Tuple[List[TrackDict], str]:
     source = detect_source(url)
     if source == "vk": return parse_vk_playlist(url)
     if source == "yandex": return parse_yandex_playlist(url)
+    if source == "soundcloud": return [], "Импорт из SoundCloud"
     return parse_spotify_playlist(url)
+
+def parse_single_track(url: str) -> dict | None:
+    """Пытается распарсить одиночную ссылку на трек (SoundCloud, VK, Yandex)."""
+    
+    # 1. Проверяем Яндекс.Музыку (через официальную библиотеку)
+    match_yandex = re.search(r"music\.yandex\.[a-z]+/(?:album/\d+/)?track/(\d+)", url, re.IGNORECASE)
+    if match_yandex:
+        track_id = match_yandex.group(1)
+        try:
+            client = get_yandex_client()
+            tracks = client.tracks([track_id])
+            if tracks and len(tracks) > 0:
+                track = tracks[0]
+                return {
+                    "title": track.title,
+                    "artist": _yandex_artist_name(track),
+                    "duration": int(track.duration_ms / 1000) if track.duration_ms else 0,
+                    "source": "yandex"
+                }
+        except Exception as e:
+            logger.error(f"Ошибка парсинга Яндекс трека: {e}")
+            return None
+
+    # 2. Проверяем ВКонтакте (требуется VK_TOKEN)
+    match_vk = re.search(r"audio(-?\d+)_(\d+)", url)
+    if match_vk:
+        token = _getenv_token("VK_TOKEN")
+        if not token:
+            logger.warning("Попытка скачать трек из ВК без токена.")
+            return None # Без токена не сможем получить название
+            
+        owner_id, audio_id = match_vk.group(1), match_vk.group(2)
+        try:
+            import vk_api
+            session = vk_api.VkApi(token=token)
+            api = session.get_api()
+            audio_info = api.audio.getById(audios=f"{owner_id}_{audio_id}")
+            if audio_info:
+                track = audio_info[0]
+                return {
+                    "title": track.get("title", "Unknown"),
+                    "artist": track.get("artist", "Unknown"),
+                    "duration": track.get("duration", 0),
+                    "source": "vk"
+                }
+        except Exception as e:
+            logger.error(f"Ошибка парсинга ВК трека: {e}")
+            return None
+
+    # 3. Защита от YouTube
+    if "youtube.com" in url or "youtu.be" in url:
+        return None
+        
+    # 4. Проверяем SoundCloud через yt-dlp
+    import yt_dlp
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True, 'noplaylist': True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info: return None
+            
+            if 'entries' in info and info['entries']:
+                return None
+                
+            return {
+                "title": info.get("title", "Unknown"),
+                "artist": info.get("uploader", info.get("artist", "Unknown")),
+                "duration": info.get("duration", 0),
+                "source": "soundcloud"
+            }
+    except Exception:
+        return None

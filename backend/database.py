@@ -5,6 +5,7 @@ import hashlib
 import os
 import secrets
 import re
+import json
 from datetime import datetime, timezone, timedelta
 from typing import Any
 from contextlib import asynccontextmanager
@@ -120,6 +121,10 @@ async def init_db() -> None:
             if "xp" not in cols:
                 await conn.execute("ALTER TABLE users ADD COLUMN xp INTEGER DEFAULT 0")
                 await conn.execute("UPDATE users SET xp = points")
+            # НОВЫЕ КОЛОНКИ:
+            if "active_theme" not in cols: await conn.execute("ALTER TABLE users ADD COLUMN active_theme TEXT DEFAULT 'dark'")
+            if "unlocked_themes" not in cols: await conn.execute("ALTER TABLE users ADD COLUMN unlocked_themes TEXT DEFAULT '[\"dark\"]'")
+            if "loop_playlist" not in cols: await conn.execute("ALTER TABLE users ADD COLUMN loop_playlist BOOLEAN DEFAULT 0")
                 
         async with conn.execute("PRAGMA table_info(tracks)") as cursor:
             cols = [r[1] for r in await cursor.fetchall()]
@@ -128,6 +133,7 @@ async def init_db() -> None:
             if "pending_playlist_id" not in cols: await conn.execute("ALTER TABLE tracks ADD COLUMN pending_playlist_id INTEGER DEFAULT NULL")
             if "pending_position" not in cols: await conn.execute("ALTER TABLE tracks ADD COLUMN pending_position INTEGER DEFAULT 0")
             if "source_url" not in cols: await conn.execute("ALTER TABLE tracks ADD COLUMN source_url TEXT DEFAULT NULL")
+            if "file_id" not in cols: await conn.execute("ALTER TABLE tracks ADD COLUMN file_id TEXT DEFAULT NULL")
 
         async with conn.execute("PRAGMA table_info(playlist_tracks)") as cursor:
             cols = [r[1] for r in await cursor.fetchall()]
@@ -408,13 +414,32 @@ async def create_user_playlist(user_id: int, title: str) -> dict[str, Any]:
         await conn.commit()
         return {"id": cursor.lastrowid, "title": title, "status": "created"}
 
-async def get_user_playlists(user_id: int) -> list[dict[str, Any]]:
+async def get_user_playlists(user_id: int, exclude_track_id: int = None) -> list[dict[str, Any]]:
     async with get_db() as conn:
-        async with conn.execute(
-            """SELECT p.id, p.title, p.price, p.is_public, p.sales_count, p.original_playlist_id, p.trailer_path, p.custom_cover, COUNT(pt.track_id) as track_count, orig_u.username as original_seller_username, orig_u.telegram_id as original_seller_tg
-               FROM user_playlists p LEFT JOIN playlist_tracks pt ON p.id = pt.playlist_id LEFT JOIN user_playlists orig_p ON p.original_playlist_id = orig_p.id LEFT JOIN users orig_u ON orig_p.user_id = orig_u.id
-               WHERE p.user_id = ? GROUP BY p.id""", (user_id,)) as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
+        if exclude_track_id:
+            query = """
+                SELECT p.id, p.title, p.price, p.is_public, p.sales_count, p.original_playlist_id, p.trailer_path, p.custom_cover, COUNT(pt.track_id) as track_count, orig_u.username as original_seller_username, orig_u.telegram_id as original_seller_tg
+                FROM user_playlists p 
+                LEFT JOIN playlist_tracks pt ON p.id = pt.playlist_id 
+                LEFT JOIN user_playlists orig_p ON p.original_playlist_id = orig_p.id 
+                LEFT JOIN users orig_u ON orig_p.user_id = orig_u.id
+                WHERE p.user_id = ? AND p.id NOT IN (SELECT playlist_id FROM playlist_tracks WHERE track_id = ?)
+                GROUP BY p.id
+            """
+            async with conn.execute(query, (user_id, exclude_track_id)) as cursor:
+                return [dict(row) for row in await cursor.fetchall()]
+        else:
+            query = """
+                SELECT p.id, p.title, p.price, p.is_public, p.sales_count, p.original_playlist_id, p.trailer_path, p.custom_cover, COUNT(pt.track_id) as track_count, orig_u.username as original_seller_username, orig_u.telegram_id as original_seller_tg
+                FROM user_playlists p 
+                LEFT JOIN playlist_tracks pt ON p.id = pt.playlist_id 
+                LEFT JOIN user_playlists orig_p ON p.original_playlist_id = orig_p.id 
+                LEFT JOIN users orig_u ON orig_p.user_id = orig_u.id
+                WHERE p.user_id = ?
+                GROUP BY p.id
+            """
+            async with conn.execute(query, (user_id,)) as cursor:
+                return [dict(row) for row in await cursor.fetchall()]
 
 async def get_playlist_by_id(playlist_id: int) -> dict[str, Any] | None:
     async with get_db() as conn:
@@ -532,12 +557,12 @@ async def replace_track_file(track_id: int, new_file_path: str, bitrate: int, du
             
         if new_source_url:
             await conn.execute(
-                "UPDATE tracks SET file_path = ?, bitrate = ?, duration = ?, status = 'pending', source_url = ? WHERE id = ?",
+                "UPDATE tracks SET file_path = ?, bitrate = ?, duration = ?, status = 'pending', source_url = ?, file_id = NULL WHERE id = ?",
                 (new_file_path, bitrate, duration, new_source_url, track_id)
             )
         else:
             await conn.execute(
-                "UPDATE tracks SET file_path = ?, bitrate = ?, duration = ?, status = 'pending' WHERE id = ?",
+                "UPDATE tracks SET file_path = ?, bitrate = ?, duration = ?, status = 'pending', file_id = NULL WHERE id = ?",
                 (new_file_path, bitrate, duration, track_id)
             )
         await conn.commit()
@@ -591,7 +616,6 @@ async def set_playlist_custom_cover(playlist_id: int, cover_path: str) -> bool:
 async def get_similar_artists(artist_name: str, limit: int = 5) -> list[str]:
     """Ищет артистов, которые часто встречаются в одних плейлистах с заданным."""
     async with get_db() as conn:
-        # Ищем пересечения в плейлистах
         query = """
             SELECT t2.artist, COUNT(*) as freq
             FROM tracks t1
@@ -607,3 +631,76 @@ async def get_similar_artists(artist_name: str, limit: int = 5) -> list[str]:
         async with conn.execute(query, (f"%{artist_name}%", f"%{artist_name}%", limit)) as cursor:
             rows = await cursor.fetchall()
             return [row["artist"] for row in rows]
+
+async def get_trending_tracks(limit: int = 5) -> list[dict[str, Any]]:
+    """Возвращает самые скачиваемые треки для пустого поиска."""
+    async with get_db() as conn:
+        async with conn.execute(
+            "SELECT * FROM tracks WHERE status = 'approved' ORDER BY download_count DESC LIMIT ?", 
+            (limit,)
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+async def get_trending_artists(limit: int = 6) -> list[dict[str, Any]]:
+    """Возвращает топ артистов по количеству скачиваний их треков."""
+    async with get_db() as conn:
+        async with conn.execute(
+            """SELECT artist, SUM(download_count) as total_downloads, MAX(id) as top_track_id 
+               FROM tracks WHERE status = 'approved' 
+               GROUP BY artist ORDER BY total_downloads DESC LIMIT ?""", 
+            (limit,)
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+async def get_tracks_by_artist(artist_name: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Возвращает треки конкретного артиста."""
+    async with get_db() as conn:
+        async with conn.execute(
+            "SELECT * FROM tracks WHERE LOWER(artist) = LOWER(?) AND status = 'approved' ORDER BY download_count DESC LIMIT ?", 
+            (artist_name, limit)
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+async def set_track_file_id(track_id: int, file_id: str) -> None:
+    async with get_db() as conn:
+        await conn.execute("UPDATE tracks SET file_id = ? WHERE id = ?", (file_id, track_id))
+        await conn.commit()
+
+async def get_tracks_without_file_id() -> list[dict[str, Any]]:
+    async with get_db() as conn:
+        async with conn.execute(
+            "SELECT * FROM tracks WHERE status = 'approved' AND file_id IS NULL AND file_path IS NOT NULL AND file_path != ''"
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+async def update_user_settings(user_id: int, active_theme: str = None, loop_playlist: bool = None) -> None:
+    async with get_db() as conn:
+        if active_theme is not None:
+            await conn.execute("UPDATE users SET active_theme = ? WHERE id = ?", (active_theme, user_id))
+        if loop_playlist is not None:
+            await conn.execute("UPDATE users SET loop_playlist = ? WHERE id = ?", (1 if loop_playlist else 0, user_id))
+        await conn.commit()
+
+async def buy_theme(user_id: int, theme_name: str, price: int) -> dict:
+    async with get_db() as conn:
+        async with conn.execute("SELECT points, unlocked_themes FROM users WHERE id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row: return {"error": "Пользователь не найден"}
+            
+            points = row["points"]
+            unlocked = json.loads(row["unlocked_themes"])
+            
+            if theme_name in unlocked:
+                return {"error": "Тема уже куплена"}
+                
+            if points < price:
+                return {"error": "Недостаточно поинтов"}
+                
+            unlocked.append(theme_name)
+            new_unlocked_str = json.dumps(unlocked)
+            
+            await conn.execute("UPDATE users SET points = points - ?, unlocked_themes = ? WHERE id = ?", (price, new_unlocked_str, user_id))
+            await conn.execute("INSERT INTO transactions (user_id, amount, reason) VALUES (?, ?, ?)", (user_id, -price, f"buy_theme_{theme_name}"))
+            await conn.commit()
+            
+            return {"ok": True, "msg": "Тема успешно куплена!", "unlocked": unlocked}

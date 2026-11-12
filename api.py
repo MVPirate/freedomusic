@@ -5,12 +5,15 @@ import uvicorn
 import logging
 from pathlib import Path
 from mutagen import File as MutagenFile
+import hmac
+import hashlib
+import time
 
 from aiogram import Bot
 from aiogram.types import FSInputFile, LabeledPrice
 from aiogram.utils.web_app import safe_parse_webapp_init_data
 
-from backend.config import TELEGRAM_BOT_TOKEN, ADMIN_ID
+from backend.config import TELEGRAM_BOT_TOKEN, ADMIN_ID, STREAM_SECRET_KEY
 from backend.database import (
     get_user, claim_daily, search_tracks, check_download_limit, 
     increment_download_count, get_track_by_id, increment_track_download, 
@@ -20,7 +23,9 @@ from backend.database import (
     delete_user_playlist, remove_playlist_from_market,
     toggle_like, get_user_liked_tracks, get_user_liked_track_ids, get_user_stats,
     report_track, remove_track_from_playlist, get_playlist_by_id,
-    set_playlist_custom_cover, get_similar_artists
+    set_playlist_custom_cover, get_similar_artists, get_trending_tracks,
+    get_trending_artists, get_tracks_by_artist, set_track_file_id,
+    update_user_settings, buy_theme
 )
 
 logger = logging.getLogger(__name__)
@@ -61,6 +66,62 @@ async def get_tg_user_id(request: Request) -> int | None:
     except Exception as e:
         logger.warning(f"Попытка подделки initData или ошибка парсинга: {e}")
         return None
+
+# --- ГЕНЕРАЦИЯ БЕЗОПАСНОЙ ССЫЛКИ НА СТРИМ ---
+def generate_stream_token(track_id: int, user_id: int) -> str:
+    expires = int(time.time()) + 3600
+    message = f"{track_id}:{user_id}:{expires}".encode('utf-8')
+    sig = hmac.new(STREAM_SECRET_KEY.encode('utf-8'), message, hashlib.sha256).hexdigest()
+    return f"user_id={user_id}&expires={expires}&sig={sig}"
+
+@app.get("/api/get_stream_url/{track_id}")
+async def api_get_stream_url(track_id: int, request: Request):
+    tg_id = await get_tg_user_id(request)
+    if not tg_id: return {"error": "Нет данных от Telegram"}
+        
+    user = await get_user(tg_id)
+    if not user: return {"error": "Пользователь не найден"}
+        
+    track = await get_track_by_id(track_id)
+    if not track: return {"error": "Трек не найден"}
+        
+    file_path = Path(track["file_path"])
+    if not file_path.exists(): return {"error": "Файл утерян"}
+        
+    token = generate_stream_token(track_id, int(user["id"]))
+    return {"url": f"/api/stream/{track_id}?{token}"}
+
+@app.get("/api/stream/{track_id}")
+async def api_stream(track_id: int, request: Request):
+    user_id_str = request.query_params.get("user_id")
+    expires_str = request.query_params.get("expires")
+    sig = request.query_params.get("sig")
+    
+    if not user_id_str or not expires_str or not sig:
+        return Response(content="Missing signature", status_code=403)
+        
+    try:
+        expires = int(expires_str)
+        user_id = int(user_id_str)
+    except ValueError:
+        return Response(content="Invalid parameters", status_code=403)
+        
+    if expires < int(time.time()):
+        return Response(content="Link expired", status_code=403)
+        
+    message = f"{track_id}:{user_id}:{expires}".encode('utf-8')
+    expected_sig = hmac.new(STREAM_SECRET_KEY.encode('utf-8'), message, hashlib.sha256).hexdigest()
+    
+    if not hmac.compare_digest(expected_sig, sig):
+        return Response(content="Invalid signature", status_code=403)
+        
+    track = await get_track_by_id(track_id)
+    if not track: return {"error": "Трек не найден"}
+    
+    file_path = Path(track["file_path"])
+    if not file_path.exists(): return {"error": "Файл утерян"}
+    
+    return FileResponse(file_path, media_type="audio/mpeg")
 
 @app.get("/api/profile")
 async def get_profile(request: Request):
@@ -135,14 +196,40 @@ async def api_search(request: Request):
             "is_liked": t["id"] in liked_ids
         })
         
-    # --- НОВАЯ ЛОГИКА РЕКОМЕНДАЦИЙ ---
     similar_artists = []
     if result:
-        # Берем главного артиста из первого трека
         main_artist = result[0]["artist"].split(",")[0].strip()
         similar_artists = await get_similar_artists(main_artist, limit=5)
         
     return {"tracks": result, "similar_artists": similar_artists}
+
+@app.get("/api/trending_artists")
+async def api_get_trending_artists(request: Request):
+    artists = await get_trending_artists(limit=10)
+    return {"artists": artists}
+
+@app.get("/api/artist_tracks")
+async def api_get_artist_tracks(request: Request):
+    artist = request.query_params.get("artist", "").strip()
+    if not artist: return {"error": "Пустой запрос"}
+    
+    tracks = await get_tracks_by_artist(artist)
+    
+    tg_id = await get_tg_user_id(request)
+    liked_ids = []
+    if tg_id:
+        user = await get_user(tg_id)
+        if user:
+            liked_ids = await get_user_liked_track_ids(int(user["id"]))
+
+    result = []
+    for t in tracks:
+        quality = t["quality_status"] if t["quality_status"] != 'none' else 'Verified'
+        result.append({
+            "id": t["id"], "artist": t["artist"], "title": t["title"], "quality": quality,
+            "is_liked": t["id"] in liked_ids
+        })
+    return {"tracks": result}
 
 @app.post("/api/download/{track_id}")
 async def api_download(track_id: int, request: Request):
@@ -158,15 +245,22 @@ async def api_download(track_id: int, request: Request):
     track = await get_track_by_id(track_id)
     if not track: return {"error": "Трек не найден"}
             
-    file_path = Path(track["file_path"])
-    if not file_path.exists(): return {"error": "Файл утерян"}
-            
     quality = track["quality_status"] if track["quality_status"] != 'none' else 'Verified'
-    await bot.send_audio(
-        chat_id=tg_id, audio=FSInputFile(file_path),
-        caption=f"🎵 {track['artist']} — {track['title']}\n⭐ Качество: {quality}",
-        title=track['title'], performer=track['artist']
-    )
+    caption = f"🎵 {track['artist']} — {track['title']}\n⭐ Качество: {quality}"
+    
+    # Если есть file_id, отправляем мгновенно
+    if track.get("file_id"):
+        await bot.send_audio(chat_id=tg_id, audio=track["file_id"], caption=caption, title=track['title'], performer=track['artist'])
+    else:
+        file_path = Path(track["file_path"])
+        if not file_path.exists(): return {"error": "Файл утерян"}
+        
+        msg = await bot.send_audio(
+            chat_id=tg_id, audio=FSInputFile(file_path),
+            caption=caption, title=track['title'], performer=track['artist']
+        )
+        if msg.audio and msg.audio.file_id:
+            await set_track_file_id(track_id, msg.audio.file_id)
         
     await increment_download_count(int(user["id"]), 1)
     await increment_track_download(track_id)
@@ -174,16 +268,6 @@ async def api_download(track_id: int, request: Request):
     if track['uploaded_by'] != int(user["id"]):
         await add_points(track['uploaded_by'], 1, f"track_download_{track_id}")
     return {"ok": True}
-
-@app.get("/api/stream/{track_id}")
-async def api_stream(track_id: int):
-    track = await get_track_by_id(track_id)
-    if not track: return {"error": "Трек не найден"}
-    
-    file_path = Path(track["file_path"])
-    if not file_path.exists(): return {"error": "Файл утерян"}
-    
-    return FileResponse(file_path, media_type="audio/mpeg")
 
 @app.get("/api/cover/{track_id}")
 async def api_cover(track_id: int):
@@ -224,7 +308,6 @@ async def api_cover(track_id: int):
     return RedirectResponse(url=fallback_url)
 
 # --- ЭНДПОИНТЫ ПЛЕЙЛИСТОВ ---
-
 @app.post("/api/playlists/create")
 async def api_create_playlist(request: Request):
     tg_id = await get_tg_user_id(request)
@@ -241,14 +324,14 @@ async def api_create_playlist(request: Request):
     return result
 
 @app.get("/api/playlists")
-async def api_get_playlists(request: Request):
+async def api_get_playlists(request: Request, exclude_track_id: int = None):
     tg_id = await get_tg_user_id(request)
     if not tg_id: return {"error": "Нет данных"}
     
     user = await get_user(tg_id)
     if not user: return {"error": "Пользователь не найден"}
         
-    playlists = await get_user_playlists(int(user["id"]))
+    playlists = await get_user_playlists(int(user["id"]), exclude_track_id)
     return {"playlists": playlists}
 
 @app.post("/api/playlists/{playlist_id}/add")
@@ -305,13 +388,11 @@ async def api_request_trailer(playlist_id: int, request: Request):
 async def api_stream_trailer(playlist_id: int):
     playlist = await get_playlist_by_id(playlist_id)
     
-    # 1. Проверяем трейлер у текущего плейлиста
     if playlist and playlist.get("trailer_path"):
         file_path = Path(playlist["trailer_path"])
         if file_path.exists():
             return FileResponse(file_path, media_type="audio/mpeg")
 
-    # 2. Если это купленный плейлист, проверяем трейлер у оригинала
     if playlist and playlist.get("original_playlist_id"):
         orig_playlist = await get_playlist_by_id(playlist["original_playlist_id"])
         if orig_playlist and orig_playlist.get("trailer_path"):
@@ -345,14 +426,12 @@ async def api_request_cover(playlist_id: int, request: Request):
 
 @app.get("/api/stream_playlist_cover/{playlist_id}")
 async def api_stream_playlist_cover(playlist_id: int):
-    # 1. Проверяем кастомную обложку у текущего плейлиста
     playlist = await get_playlist_by_id(playlist_id)
     if playlist and playlist.get("custom_cover"):
         file_path = Path(playlist["custom_cover"])
         if file_path.exists():
             return FileResponse(file_path)
     
-    # 2. Если это купленный плейлист, проверяем обложку у оригинала
     if playlist and playlist.get("original_playlist_id"):
         orig_playlist = await get_playlist_by_id(playlist["original_playlist_id"])
         if orig_playlist and orig_playlist.get("custom_cover"):
@@ -360,12 +439,10 @@ async def api_stream_playlist_cover(playlist_id: int):
             if orig_path.exists():
                 return FileResponse(orig_path)
 
-    # 3. Если обложек нет, берем обложку первого трека
     tracks = await get_playlist_tracks(playlist_id)
     if tracks:
         return RedirectResponse(url=f"/api/cover/{tracks[0]['id']}")
     
-    # 4. Если плейлист пуст, отдаем дефолтную папку
     return RedirectResponse(url="https://cdn-icons-png.flaticon.com/512/3844/3844724.png")
 
 # --- ЭНДПОИНТ ДЛЯ АДМИНА ---
@@ -380,7 +457,6 @@ async def api_admin_delete_track(track_id: int, request: Request):
     return {"error": "Не удалось удалить"}
 
 # --- ЭНДПОИНТЫ МАРКЕТПЛЕЙСА ---
-
 @app.post("/api/market/sell/{playlist_id}")
 async def api_sell_playlist(playlist_id: int, request: Request):
     data = await request.json()
@@ -432,7 +508,6 @@ async def api_remove_from_market(playlist_id: int):
     return {"ok": True, "msg": "Плейлист снят с продажи"}
 
 # --- ЭНДПОИНТЫ ДЛЯ ЛАЙКОВ ---
-
 @app.post("/api/like/{track_id}")
 async def api_toggle_like(track_id: int, request: Request):
     tg_id = await get_tg_user_id(request)
@@ -465,6 +540,37 @@ async def api_get_stats(request: Request):
     
     stats = await get_user_stats(int(user["id"]))
     return stats
+
+# 1. Получение и обновление настроек
+@app.post("/api/settings")
+async def api_update_settings(request: Request):
+    tg_id = await get_tg_user_id(request)
+    if not tg_id: return {"error": "Нет данных"}
+    
+    user = await get_user(tg_id)
+    if not user: return {"error": "Пользователь не найден"}
+    
+    data = await request.json()
+    active_theme = data.get("active_theme")
+    loop_playlist = data.get("loop_playlist")
+    
+    await update_user_settings(int(user["id"]), active_theme, loop_playlist)
+    return {"ok": True}
+
+# 2. Покупка темы
+@app.post("/api/themes/buy")
+async def api_buy_theme(request: Request):
+    tg_id = await get_tg_user_id(request)
+    if not tg_id: return {"error": "Нет данных"}
+    
+    user = await get_user(tg_id)
+    if not user: return {"error": "Пользователь не найден"}
+    
+    data = await request.json()
+    theme_name = data.get("theme_name")
+    
+    result = await buy_theme(int(user["id"]), theme_name, 50) # Цена 50 поинтов
+    return result
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

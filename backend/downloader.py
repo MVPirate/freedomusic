@@ -1,11 +1,12 @@
 import os
 import asyncio
 import yt_dlp
+import requests
 from pathlib import Path
 import logging
 import uuid
 import re
-import difflib # <-- ДОБАВЛЕНО
+import difflib
 
 logger = logging.getLogger(__name__)
 
@@ -157,3 +158,78 @@ def fix_audio_tags(file_path: str, artist: str, title: str) -> None:
         audio.save()
     except Exception as e:
         logger.error(f"Не удалось исправить теги: {e}")
+
+# --- ОБЛОЖКИ: ПРОВЕРКА И ВШИВАНИЕ ИЗ SOUNDCLOUD ---
+def ensure_track_has_cover(file_path: str, artist: str, title: str) -> bool:
+    """Проверяет наличие обложки в MP3. Если нет — качает из SoundCloud и вшивает."""
+    try:
+        from mutagen.mp3 import MP3
+        from mutagen.id3 import ID3
+        audio = MP3(file_path, ID3=ID3)
+        if audio.tags and audio.tags.getall('APIC'):
+            return True
+    except Exception:
+        pass
+
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True, 'skip_download': True}) as ydl:
+            result = ydl.extract_info(f"scsearch1:{artist} - {title} audio", download=False)
+            if not result or not result.get('entries'):
+                return False
+
+            entry = result['entries'][0]
+            thumb_url = None
+            if 'thumbnails' in entry:
+                thumb_url = entry['thumbnails'][-1]['url']
+            elif 'thumbnail' in entry:
+                thumb_url = entry['thumbnail']
+
+            if not thumb_url:
+                return False
+
+            response = requests.get(thumb_url, timeout=10)
+            if response.status_code != 200:
+                return False
+
+            from mutagen.id3 import APIC, ID3NoHeaderError
+            try:
+                audio = MP3(file_path, ID3=ID3)
+            except ID3NoHeaderError:
+                audio = MP3(file_path)
+                audio.add_tags()
+                audio = MP3(file_path, ID3=ID3)
+
+            audio.tags.add(
+                APIC(
+                    encoding=3, mime='image/jpeg', type=3, desc='Cover',
+                    data=response.content
+                )
+            )
+            audio.save()
+            logger.info(f"Обложка успешно добавлена для {artist} - {title}")
+            return True
+    except Exception as e:
+        logger.error(f"Ошибка при добавлении обложки для {artist} - {title}: {e}")
+        return False
+
+# --- СКАЧИВАНИЕ ПО ПРЯМОЙ ССЫЛКЕ (для /import одиночного трека) ---
+def _sync_download_direct_url(url: str, filename: str):
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    unique_filename = f"{filename}_{uuid.uuid4().hex[:6]}"
+    base_path = UPLOADS_DIR / unique_filename
+    ydl_opts = _get_ydl_opts(base_path)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            webpage_url = info.get('webpage_url', url)
+        mp3_path = base_path.with_suffix('.mp3')
+        if mp3_path.exists():
+            return str(mp3_path), None, webpage_url
+    except Exception as e:
+        logger.error(f"Ошибка скачивания по прямой ссылке {url}: {e}")
+        return None, "error", None
+    return None, "error", None
+
+async def download_track_from_direct_url(url: str, artist: str, title: str):
+    safe_name = "".join(c for c in f"{artist} - {title}" if c.isalnum() or c in " -_").strip()
+    return await asyncio.to_thread(_sync_download_direct_url, url, safe_name)

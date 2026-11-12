@@ -15,7 +15,8 @@ from aiogram.types import (
     Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, 
     CallbackQuery, FSInputFile, LabeledPrice, PreCheckoutQuery,
     ReplyKeyboardMarkup, KeyboardButton, MenuButtonWebApp, 
-    BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+    BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
+    InlineQuery, InlineQueryResultCachedAudio
 )
 from aiogram.client.session.aiohttp import AiohttpSession
 from dotenv import load_dotenv
@@ -30,12 +31,13 @@ from backend.database import (
     get_user_by_internal_id, give_premium, remove_premium,
     update_track_metadata, delete_track, replace_track_file,
     create_user_playlist, get_user_playlist_by_title, add_track_to_playlist,
-    set_playlist_trailer, set_playlist_custom_cover
+    set_playlist_trailer, set_playlist_custom_cover,
+    set_track_file_id, get_tracks_without_file_id
 )
-from backend.parser import detect_source, parse_playlist, get_yandex_client
+from backend.parser import detect_source, parse_playlist, get_yandex_client, parse_single_track
 from backend.downloader import (
     download_track_from_youtube, fix_audio_tags, FFMPEG_PATH, find_soundcloud_link,
-    download_from_soundcloud_url
+    download_from_soundcloud_url, ensure_track_has_cover, download_track_from_direct_url
 )
 
 try:
@@ -109,7 +111,11 @@ async def create_preview_audio(file_path: Path, duration: int) -> Path | None:
         "-map", "[outa]", "-c:a", "libmp3lame", str(preview_path)
     ]
     try:
-        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
+        result = await asyncio.to_thread(
+            subprocess.run, cmd, 
+            capture_output=True, text=True, 
+            encoding='utf-8', errors='replace'
+        )
         if result.returncode != 0: return None
         return preview_path
     except Exception as e:
@@ -203,9 +209,13 @@ async def download_worker():
         imp_src = task_data.get('import_source', 'unknown')
         pending_playlist_id = task_data.get('pending_playlist_id')
         pending_position = task_data.get('pending_position', 0)
+        direct_url = task_data.get('direct_url')
 
         try:
-            file_path, err_type, source_url = await download_track_from_youtube(artist, title)
+            if direct_url:
+                file_path, err_type, source_url = await download_track_from_direct_url(direct_url, artist, title)
+            else:
+                file_path, err_type, source_url = await download_track_from_youtube(artist, title)
             if file_path:
                 await asyncio.to_thread(fix_audio_tags, file_path, artist, title)
                 bitrate, duration = await asyncio.to_thread(get_audio_info, Path(file_path))
@@ -249,7 +259,10 @@ async def download_worker():
                 if task_data.get('limit_reached'):
                     await bot.send_message(tg_id, "⚠️ **Достигнут дневной лимит!**\nОстальные треки из плейлиста не были добавлены.\n\nПовысьте свой уровень или купите **Премиум**, чтобы снять все ограничения.")
                 else:
-                    await bot.send_message(tg_id, "✅ Все треки из плейлиста успешно скачаны и добавлены в базу!")
+                    if task_data.get('is_single'):
+                        await bot.send_message(tg_id, "✅ Одиночный трек успешно скачан и добавлен в базу!")
+                    else:
+                        await bot.send_message(tg_id, "✅ Все треки из плейлиста успешно скачаны и добавлены в базу!")
 
 @dp.message(Command("import"))
 async def cmd_import(message: Message, command: CommandObject) -> None:
@@ -262,6 +275,47 @@ async def cmd_import(message: Message, command: CommandObject) -> None:
         if not limit_info["allowed"]: return await message.answer(f"⛔ {limit_info['msg']}")
         
         remaining_limit = limit_info["remaining"]
+
+        # ПРОВЕРКА НА ОДИНОЧНЫЙ ТРЕК
+        single_track = await asyncio.to_thread(parse_single_track, url)
+        if single_track:
+            artist, title = single_track['artist'], single_track['title']
+            
+            # Создаем или находим плейлист "Мои загрузки" для таких треков
+            pl_title = "Синглы и загрузки"
+            existing_pl = await get_user_playlist_by_title(int(user["id"]), pl_title)
+            if existing_pl:
+                new_pl_id = existing_pl["id"]
+            else:
+                new_pl = await create_user_playlist(int(user["id"]), pl_title)
+                new_pl_id = new_pl["id"]
+
+            await message.answer(f"🎵 Найден одиночный трек: **{artist} - {title}**\n⏳ Добавляю в очередь...")
+            
+            await increment_download_count(int(user["id"]), 1)
+            
+            try: src_type = detect_source(url)
+            except ValueError: src_type = "direct"
+
+            task_data = {
+                'user_id': int(user["id"]), 'tg_id': message.from_user.id,
+                'artist': artist, 'title': title,
+                'original_duration': single_track.get('duration', 0), 'import_source': src_type,
+                'is_last': True, 'limit_reached': False,
+                'pending_playlist_id': new_pl_id,
+                'pending_position': 0,
+                'is_single': True,
+            }
+            
+            # Если это SoundCloud — качаем напрямую по ссылке.
+            # Яндекс и ВК — качаем через поиск на SoundCloud (по названию).
+            if single_track.get("source") == "soundcloud":
+                task_data['direct_url'] = url
+                
+            await download_queue.put(task_data)
+            return # Выходим, чтобы не запускать парсинг плейлиста
+
+        # Если это не одиночный трек, идем дальше по старой логике
         await message.answer(f"🔎 Сканирую плейлист... (Доступно сегодня: {remaining_limit})")
         
         tracks, playlist_title = await asyncio.to_thread(parse_playlist, url)
@@ -398,7 +452,7 @@ async def process_admin_panel(callback: CallbackQuery):
             await callback.message.answer(f"⭐ **Баланс звёзд:**\n{star_amount.amount} Stars", parse_mode="Markdown")
         except: await callback.message.answer("❌ Ошибка баланса.")
     elif action == "help":
-        await callback.message.answer("**Админ-команды:**\n`/moderate`\n`/deletetrack <id>`\n`/addlimit <id> <число>`\n`/givepremium <id> <дней>`\n`/removepremium <id>`\n`/starbalance`", parse_mode="Markdown")
+        await callback.message.answer("**Админ-команды:**\n`/moderate`\n`/deletetrack <id>`\n`/addlimit <id> <число>`\n`/givepremium <id> <дней>`\n`/removepremium <id>`\n`/starbalance`\n`/cache_all`", parse_mode="Markdown")
 
 @dp.message(Command("resetlimit"))
 async def cmd_resetlimit(message: Message) -> None:
@@ -458,6 +512,65 @@ async def cmd_deletetrack(message: Message, command: CommandObject) -> None:
     if await delete_track(int(args)): await message.answer(f"🗑️ Трек {args} удален.")
     else: await message.answer(f"❌ Трек {args} не найден.")
 
+# --- КЕШИРОВАНИЕ ВСЕХ ТРЕКОВ (file_id + обложки) ---
+@dp.message(Command("cache_all"))
+async def cmd_cache_all(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    
+    tracks = await get_tracks_without_file_id()
+    if not tracks:
+        return await message.answer("✅ Все треки уже имеют file_id. Кеширование не требуется.")
+        
+    status_msg = await message.answer(f"⏳ Начинаю обработку {len(tracks)} треков (кеширование + обложки). Это займет время...")
+    
+    success_count = 0
+    fail_count = 0
+    
+    for i, track in enumerate(tracks):
+        file_path = Path(track["file_path"])
+        if not file_path.exists():
+            fail_count += 1
+            continue
+            
+        # 1. Пытаемся починить обложку (если её нет)
+        await asyncio.to_thread(ensure_track_has_cover, str(file_path), track["artist"], track["title"])
+            
+        msg = None
+        try:
+            # 2. Отправляем трек в чат (уже с обложкой) для генерации file_id
+            msg = await bot.send_audio(
+                chat_id=message.chat.id,
+                audio=FSInputFile(file_path),
+                caption=f"🎵 {track['artist']} — {track['title']}",
+                title=track['title'], 
+                performer=track['artist']
+            )
+            
+            if msg.audio and msg.audio.file_id:
+                await set_track_file_id(track["id"], msg.audio.file_id)
+                success_count += 1
+            else:
+                fail_count += 1
+                
+        except Exception as e:
+            log(f"Ошибка кеширования трека {track['id']}: {e}")
+            fail_count += 1
+            
+        finally:
+            if msg:
+                try: await msg.delete()
+                except: pass
+                
+        # Пауза, чтобы не получить бан (чуть больше, так как еще ищем обложки)
+        await asyncio.sleep(2.0)
+        
+        if (i + 1) % 10 == 0:
+            try:
+                await status_msg.edit_text(f"⏳ Прогресс: {i + 1} / {len(tracks)}...\n✅ Успешно: {success_count} | ❌ Ошибок: {fail_count}")
+            except: pass
+            
+    await status_msg.edit_text(f"✅ **Обработка завершена!**\n\nУспешно: {success_count}\nОшибок: {fail_count}\n\nТеперь все эти треки имеют обложки и доступны в инлайн-поиске!", parse_mode="Markdown")
+
 # --- МОДЕРАЦИЯ ---
 async def _send_next_moderation_track(message: Message, admin_internal_id: int):
     tracks = await get_pending_tracks(limit=1)
@@ -469,7 +582,7 @@ async def _send_next_moderation_track(message: Message, admin_internal_id: int):
     if not file_path:
         orig_dur = track.get("original_duration", 0)
         imp_src = track.get("import_source", "unknown")
-        source_names = {"yandex": "Яндекс.Музыка", "vk": "ВКонтакте", "spotify": "Spotify", "telegram": "Файл пользователя"}
+        source_names = {"yandex": "Яндекс.Музыка", "vk": "ВКонтакте", "spotify": "Spotify", "telegram": "Файл пользователя", "soundcloud": "SoundCloud"}
         src_display = source_names.get(imp_src, "Неизвестно")
         
         caption = (
@@ -504,7 +617,7 @@ async def _send_next_moderation_track(message: Message, admin_internal_id: int):
 
     orig_dur = track.get("original_duration", 0)
     imp_src = track.get("import_source", "telegram")
-    source_names = {"yandex": "Яндекс.Музыка", "vk": "ВКонтакте", "spotify": "Spotify", "telegram": "Файл пользователя"}
+    source_names = {"yandex": "Яндекс.Музыка", "vk": "ВКонтакте", "spotify": "Spotify", "telegram": "Файл пользователя", "soundcloud": "SoundCloud"}
     src_display = source_names.get(imp_src, "Неизвестно")
     
     dur_warning = ""
@@ -608,7 +721,7 @@ async def process_moderation(callback: CallbackQuery):
             
         kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
         
-        source_names = {"yandex": "Яндекс.Музыка", "vk": "ВКонтакте", "spotify": "Spotify", "telegram": "Файл пользователя"}
+        source_names = {"yandex": "Яндекс.Музыка", "vk": "ВКонтакте", "spotify": "Spotify", "telegram": "Файл пользователя", "soundcloud": "SoundCloud"}
         src_display = source_names.get(track.get('import_source', 'unknown'), "Неизвестно")
 
         orig_dur = track.get("original_duration", 0)
@@ -948,6 +1061,39 @@ async def handle_text(message: Message) -> None:
     await _ensure_user(message)
     await message.answer("Я пока учусь! Используй /help")
 
+# --- INLINE-РЕЖИМ ---
+@dp.inline_query()
+async def inline_query_handler(inline_query: InlineQuery) -> None:
+    query = inline_query.query.strip()
+    if not query:
+        return
+        
+    tracks = await search_tracks(query, limit=20)
+    results = []
+    
+    for t in tracks:
+        # Если у трека нет file_id, мы не можем отправить его в инлайн-режиме 
+        # (из-за HMAC-защиты стрима). Поэтому пропускаем такие треки.
+        if not t.get("file_id"):
+            continue
+            
+        quality = t["quality_status"] if t["quality_status"] != 'none' else 'Verified'
+        
+        results.append(
+            InlineQueryResultCachedAudio(
+                id=str(t["id"]),
+                audio_file_id=t["file_id"], # <--- Используем file_id напрямую
+                caption=f"🎵 {t['artist']} — {t['title']}\n⭐ Качество: {quality}"
+            )
+        )
+        
+        if len(results) >= 10: # Ограничиваем выдачу 10 треками для удобства
+            break
+            
+    # Если результатов нет (например, треки еще не скачаны ни разу), 
+    # можно вернуть пустой список с сообщением (опционально)
+    await inline_query.answer(results, cache_time=5, is_personal=True)
+
 async def main() -> None:
     if not TELEGRAM_BOT_TOKEN: sys.exit(1)
     log("Инициализация базы данных...")
@@ -955,7 +1101,7 @@ async def main() -> None:
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="🎵 Открыть плеер", web_app=WebAppInfo(url=WEBAPP_STUB_URL)))
     await bot.set_my_commands(commands=[BotCommand(command="start", description="Главное меню"), BotCommand(command="profile", description="Мой профиль"), BotCommand(command="import", description="Импорт плейлиста"), BotCommand(command="search", description="Поиск в базе")], scope=BotCommandScopeDefault())
-    await bot.set_my_commands(commands=[BotCommand(command="admin", description="👑 Админ-панель"), BotCommand(command="moderate", description="⚙️ Модерация")], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    await bot.set_my_commands(commands=[BotCommand(command="admin", description="👑 Админ-панель"), BotCommand(command="moderate", description="⚙️ Модерация"), BotCommand(command="cache_all", description="🖼 Кеширование треков + обложки")], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     asyncio.create_task(download_worker())
     log("Запуск бота...")
     await dp.start_polling(bot)
