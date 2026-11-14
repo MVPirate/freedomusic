@@ -24,11 +24,9 @@ def normalize_artist(artist_name: str) -> str:
     if not artist_name: return "Unknown"
     name = artist_name.strip()
 
-    # 1. Отрезаем всё после &, feat, prod, запятой (например, "Ноггано, Купэ" -> "Ноггано")
     name = re.split(r'\s*(?:&|feat\.?|ft\.?|prod\.?|при\s+уч\.?|,)\s*', name, flags=re.IGNORECASE)[0]
     name = name.strip()
 
-    # 2. Словарь ручных алиасов (сюда можно добавлять любые вариации)
     aliases = {
         "мияги": "Miyagi",
         "miyagi": "Miyagi",
@@ -49,9 +47,17 @@ def normalize_artist(artist_name: str) -> str:
         return aliases[lower_name]
 
     return name
+
+def norm_key(s: str) -> str:
+    """Ключ нормализации для быстрого поиска дубликатов: только [a-z0-9а-я]."""
+    if not s: return ""
+    return re.sub(r'[\W_]+', '', str(s).casefold())
 # ============================================================
 
 LEVEL_THRESHOLDS = ((3000, "Меценат"), (1501, "Легенда"), (601, "Куратор"), (201, "Коллекционер"), (0, "Новичок"))
+
+# Лимиты по уровням — вынесено, чтобы использовать и в check_download_limit, и в reserve_downloads
+LEVEL_LIMITS = {"Новичок": 3, "Коллекционер": 5, "Куратор": 10, "Легенда": 20, "Меценат": 50}
 
 def get_level_by_points(points: int) -> str:
     for threshold, name in LEVEL_THRESHOLDS:
@@ -139,7 +145,7 @@ async def init_db() -> None:
             CREATE TRIGGER IF NOT EXISTS tracks_ad AFTER DELETE ON tracks BEGIN
                 INSERT INTO tracks_fts(tracks_fts, rowid, title, artist) VALUES('delete', old.id, old.title, old.artist);
             END;
-            CREATE TRIGGER IF NOT EXISTS tracks_au AFTER UPDATE ON tracks BEGIN
+            CREATE TRIGGER IF NOT EXISTS tracks_au AFTER UPDATE OF title, artist ON tracks BEGIN
                 INSERT INTO tracks_fts(tracks_fts, rowid, title, artist) VALUES('delete', old.id, old.title, old.artist);
                 INSERT INTO tracks_fts(rowid, title, artist) VALUES (new.id, new.title, new.artist);
             END;
@@ -168,6 +174,9 @@ async def init_db() -> None:
             if "pending_position" not in cols: await conn.execute("ALTER TABLE tracks ADD COLUMN pending_position INTEGER DEFAULT 0")
             if "source_url" not in cols: await conn.execute("ALTER TABLE tracks ADD COLUMN source_url TEXT DEFAULT NULL")
             if "file_id" not in cols: await conn.execute("ALTER TABLE tracks ADD COLUMN file_id TEXT DEFAULT NULL")
+            # --- НОВЫЕ КОЛОНКИ ДЛЯ БЫСТРОГО ПОИСКА ДУБЛИКАТОВ ---
+            if "artist_norm" not in cols: await conn.execute("ALTER TABLE tracks ADD COLUMN artist_norm TEXT DEFAULT NULL")
+            if "title_norm" not in cols: await conn.execute("ALTER TABLE tracks ADD COLUMN title_norm TEXT DEFAULT NULL")
 
         async with conn.execute("PRAGMA table_info(playlist_tracks)") as cursor:
             cols = [r[1] for r in await cursor.fetchall()]
@@ -181,11 +190,31 @@ async def init_db() -> None:
             if "trailer_path" not in cols: await conn.execute("ALTER TABLE user_playlists ADD COLUMN trailer_path TEXT DEFAULT NULL")
             if "custom_cover" not in cols: await conn.execute("ALTER TABLE user_playlists ADD COLUMN custom_cover TEXT DEFAULT NULL")
 
-        # --- колонка position в таблице likes ---
         async with conn.execute("PRAGMA table_info(likes)") as cursor:
             cols = [r[1] for r in await cursor.fetchall()]
             if "position" not in cols: await conn.execute("ALTER TABLE likes ADD COLUMN position INTEGER DEFAULT 0")
 
+        await conn.commit()
+
+        # --- ЗАПОЛНЕНИЕ artist_norm / title_norm ДЛЯ СТАРЫХ ТРЕКОВ ---
+        async with conn.execute(
+            "SELECT id, artist, title FROM tracks WHERE artist_norm IS NULL OR title_norm IS NULL"
+        ) as cursor:
+            to_fill = await cursor.fetchall()
+        if to_fill:
+            for r in to_fill:
+                a_norm = norm_key(normalize_artist(r["artist"]))
+                t_norm = norm_key(r["title"])
+                await conn.execute(
+                    "UPDATE tracks SET artist_norm = ?, title_norm = ? WHERE id = ?",
+                    (a_norm, t_norm, r["id"])
+                )
+            await conn.commit()
+
+        # --- ИНДЕКС ДЛЯ БЫСТРОГО ПОИСКА ДУБЛИКАТОВ ---
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tracks_norm ON tracks(artist_norm, title_norm)"
+        )
         await conn.commit()
 
 async def get_user(telegram_id: int) -> dict[str, Any]:
@@ -231,28 +260,52 @@ def _compute_file_hash(file_path: str | None, title: str, artist: str, user_id: 
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 # ============================================================
-# ОБНОВЛЁННЫЙ UPLOAD_TRACK (оптимизированная проверка дубликатов)
+# ОБНОВЛЁННЫЙ UPLOAD_TRACK (нормализованная проверка дубликатов)
 # ============================================================
 async def upload_track(user_id: int, title: str, artist: str, file_path: str, source: str, bitrate: int = 0, duration: int = 0, original_duration: int = 0, import_source: str = "unknown", pending_playlist_id: int = None, pending_position: int = 0, source_url: str = None) -> dict[str, Any]:
     file_hash = _compute_file_hash(file_path, title, artist, user_id)
+    
+    a_norm = norm_key(normalize_artist(artist))
+    t_norm = norm_key(title)
+
     async with get_db() as conn:
-        # --- ОПТИМИЗИРОВАННАЯ ПРОВЕРКА: ищем только по title (SQL-фильтр) ---
-        t_clean = re.sub(r'[\W_]+', '', title.lower())
-        async with conn.execute("SELECT id, artist, title FROM tracks WHERE LOWER(title) = LOWER(?)", (title,)) as cursor:
-            rows = await cursor.fetchall()
-            
-        a_clean = re.sub(r'[\W_]+', '', normalize_artist(artist).lower())
-        for row in rows:
-            db_a = re.sub(r'[\W_]+', '', normalize_artist(row["artist"]).lower())
-            db_t = re.sub(r'[\W_]+', '', row["title"].lower())
-            if (a_clean in db_a or db_a in a_clean) and (t_clean in db_t or db_t in t_clean):
+        # Быстрая проверка по нормализованным колонкам
+        async with conn.execute(
+            "SELECT id, file_path FROM tracks WHERE artist_norm = ? AND title_norm = ? LIMIT 1",
+            (a_norm, t_norm)
+        ) as cursor:
+            existing = await cursor.fetchone()
+
+        if existing:
+            # Если трек был в базе, но файла нет — перезаписываем его, а не падаем
+            existing_file = existing["file_path"]
+            if existing_file and os.path.isfile(existing_file):
                 raise ValueError(f"Трек '{artist} — {title}' уже есть в базе!")
-        # ------------------------------------------------------------------
+            else:
+                await conn.execute(
+                    """UPDATE tracks SET
+                          title = ?, artist = ?, file_path = ?, file_hash = ?,
+                          source = ?, source_url = ?, uploaded_by = ?,
+                          bitrate = ?, duration = ?, original_duration = ?,
+                          import_source = ?, status = 'pending',
+                          pending_playlist_id = ?, pending_position = ?,
+                          file_id = NULL
+                       WHERE id = ?""",
+                    (title, artist, file_path, file_hash,
+                     source, source_url, user_id,
+                     bitrate, duration, original_duration,
+                     import_source, pending_playlist_id, pending_position,
+                     existing["id"])
+                )
+                await conn.commit()
+                async with conn.execute("SELECT * FROM tracks WHERE id = ?", (existing["id"],)) as c:
+                    return dict(await c.fetchone())
+
         try:
             cursor = await conn.execute(
-                """INSERT INTO tracks (title, artist, file_path, file_hash, source, source_url, uploaded_by, bitrate, duration, original_duration, import_source, status, pending_playlist_id, pending_position) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
-                (title, artist, file_path, file_hash, source, source_url, user_id, bitrate, duration, original_duration, import_source, pending_playlist_id, pending_position)
+                """INSERT INTO tracks (title, artist, file_path, file_hash, source, source_url, uploaded_by, bitrate, duration, original_duration, import_source, status, pending_playlist_id, pending_position, artist_norm, title_norm)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+                (title, artist, file_path, file_hash, source, source_url, user_id, bitrate, duration, original_duration, import_source, pending_playlist_id, pending_position, a_norm, t_norm)
             )
             track_id = cursor.lastrowid
             await conn.commit()
@@ -323,8 +376,7 @@ async def check_download_limit(user_id: int, is_premium: bool) -> dict[str, Any]
             today = now.strftime("%Y-%m-%d")
             downloads, last_date = row["downloads_today"] or 0, row["last_download_date"]
             
-            level_limits = {"Новичок": 3, "Коллекционер": 5, "Куратор": 10, "Легенда": 20, "Меценат": 50}
-            limit_from_level = level_limits.get(row["level"], 3)
+            limit_from_level = LEVEL_LIMITS.get(row["level"], 3)
             
             if row["telegram_id"] == ADMIN_ID:
                 limit = row["daily_download_limit"] if row["daily_download_limit"] is not None else 3
@@ -338,40 +390,88 @@ async def check_download_limit(user_id: int, is_premium: bool) -> dict[str, Any]
             if downloads >= limit: return {"allowed": False, "msg": f"Лимит бесплатных скачиваний на сегодня исчерпан ({limit}/{limit}). Повысь уровень или купи Premium!", "limit": limit, "used": downloads}
             return {"allowed": True, "remaining": limit - downloads, "limit": limit, "used": downloads}
 
+# ============================================================
+# АТОМАРНЫЕ ЛИМИТЫ: резервирование и возврат
+# ============================================================
+async def reserve_downloads(user_id: int, want: int = 1) -> int:
+    """Атомарно резервирует до `want` скачиваний. Возвращает, сколько реально выдано."""
+    if want <= 0: return 0
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    async with get_db() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            async with conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)) as cur:
+                u = await cur.fetchone()
+            if not u:
+                await conn.rollback()
+                return 0
+
+            if is_premium_active(dict(u)):
+                await conn.commit()
+                return want
+
+            used = (u["downloads_today"] or 0) if u["last_download_date"] == today else 0
+
+            if u["telegram_id"] == ADMIN_ID:
+                limit = u["daily_download_limit"] if u["daily_download_limit"] is not None else 3
+            else:
+                limit = max(LEVEL_LIMITS.get(u["level"], 3), u["daily_download_limit"] or 0)
+
+            grant = max(0, min(want, limit - used))
+            if grant:
+                await conn.execute(
+                    "UPDATE users SET downloads_today = ?, last_download_date = ? WHERE id = ?",
+                    (used + grant, today, user_id)
+                )
+            await conn.commit()
+            return grant
+        except Exception:
+            await conn.rollback()
+            raise
+
+async def refund_downloads(user_id: int, n: int = 1) -> None:
+    """Возвращает лимит, если трек не скачался."""
+    if n <= 0: return
+    async with get_db() as conn:
+        await conn.execute(
+            "UPDATE users SET downloads_today = MAX(downloads_today - ?, 0) WHERE id = ?",
+            (n, user_id)
+        )
+        await conn.commit()
+# ============================================================
+
 async def increment_download_count(user_id: int, count: int) -> None:
     async with get_db() as conn:
         await conn.execute("UPDATE users SET downloads_today = downloads_today + ? WHERE id = ?", (count, user_id))
         await conn.commit()
 
 # ============================================================
-# ОБНОВЛЁННЫЙ CHECK_TRACK_EXISTS (с нормализацией + флаг "упавший")
+# ОБНОВЛЁННЫЙ CHECK_TRACK_EXISTS (безопасный, без DELETE)
 # ============================================================
 async def check_track_exists(artist: str, title: str) -> int | None:
-    def clean(s):
-        if not s: return ""
-        s = str(s).lower().replace('\xa0', ' ')
-        s = re.sub(r'[\W_]+', '', s) # Удаляем вообще все спецсимволы и пробелы
-        return s
-        
-    a_clean, t_clean = clean(normalize_artist(artist)), clean(title)
+    a_norm = norm_key(normalize_artist(artist))
+    t_norm = norm_key(title)
+
+    if not a_norm or not t_norm:
+        return None
+
     async with get_db() as conn:
-        async with conn.execute("SELECT id, artist, title, file_path FROM tracks") as cursor:
-            rows = await cursor.fetchall()
-        for row in rows:
-            db_a, db_t = clean(row["artist"]), clean(row["title"])
-            
-            a_match = (a_clean in db_a) or (db_a in a_clean)
-            t_match = (t_clean in db_t) or (db_t in t_clean)
-            
-            if a_match and t_match:
-                file_path = row["file_path"]
-                if file_path and os.path.isfile(file_path): 
-                    return row["id"] 
-                else:
-                    await conn.execute("DELETE FROM tracks WHERE id = ?", (row["id"],))
-                    await conn.commit()
-                    return -1  # Трек был, но файл утерян/не скачался
-    return None
+        async with conn.execute(
+            "SELECT id, file_path FROM tracks WHERE artist_norm = ? AND title_norm = ? LIMIT 1",
+            (a_norm, t_norm)
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        if not row:
+            return None
+
+        if row["file_path"] and os.path.isfile(row["file_path"]):
+            return row["id"]
+
+        # Просто возвращаем -1. Не удаляем, чтобы не сломать внешние ключи (плейлисты/лайки).
+        # upload_track увидит существующую запись и перезапишет её новым файлом.
+        return -1
+# ============================================================
 
 async def get_pending_tracks(limit: int = 10) -> list[dict[str, Any]]:
     async with get_db() as conn:
@@ -399,10 +499,17 @@ async def update_track_status(track_id: int, new_status: str, admin_id: int) -> 
         await conn.execute("UPDATE tracks SET status = ?, verified_by = ?, quality_status = ? WHERE id = ?", (new_status, admin_id, quality, track_id))
         await conn.commit()
 
+# ============================================================
+# ОБНОВЛЁННЫЙ SEARCH_TRACKS (безопасный FTS5)
+# ============================================================
 async def search_tracks(query: str, limit: int = 10) -> list[dict[str, Any]]:
     safe_query = re.sub(r'[^\w\s]', ' ', query).strip()
     if not safe_query: return []
-    search_str = " AND ".join([f"{word}*" for word in safe_query.split()])
+    
+    words = [w for w in safe_query.split() if len(w) >= 2]
+    if not words: return []
+    search_str = " AND ".join([f'"{w}"*' for w in words])
+    
     async with get_db() as conn:
         try:
             sql = "SELECT t.* FROM tracks t JOIN tracks_fts fts ON t.id = fts.rowid WHERE tracks_fts MATCH ? AND t.status = 'approved' ORDER BY t.download_count DESC LIMIT ?"
@@ -411,6 +518,7 @@ async def search_tracks(query: str, limit: int = 10) -> list[dict[str, Any]]:
         except Exception as e:
             print(f"[DB] Ошибка поиска FTS5: {e}")
             return []
+# ============================================================
 
 async def get_track_by_id(track_id: int) -> dict[str, Any] | None:
     async with get_db() as conn:
@@ -429,11 +537,28 @@ async def get_user_by_internal_id(user_id: int) -> dict[str, Any] | None:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
+# --- НОВАЯ ФУНКЦИЯ: реальная проверка премиума по сроку ---
+def is_premium_active(user: dict) -> bool:
+    if not user.get("is_premium"): return False
+    exp = user.get("premium_expires_at")
+    if not exp: return True
+    return exp > datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+# ------------------------------------------------------------
+
 async def give_premium(user_id: int, days: int) -> None:
-    expires = datetime.now(timezone.utc) + timedelta(days=days)
-    expires_str = expires.strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(timezone.utc)
     async with get_db() as conn:
-        await conn.execute("UPDATE users SET is_premium = 1, premium_expires_at = ? WHERE id = ?", (expires_str, user_id))
+        await conn.execute("BEGIN IMMEDIATE")
+        async with conn.execute("SELECT premium_expires_at FROM users WHERE id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+        base = now
+        if row and row["premium_expires_at"]:
+            try:
+                cur_exp = datetime.strptime(row["premium_expires_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                base = max(now, cur_exp)
+            except: pass
+        exp = (base + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        await conn.execute("UPDATE users SET is_premium = 1, premium_expires_at = ? WHERE id = ?", (exp, user_id))
         await conn.commit()
 
 async def remove_premium(user_id: int) -> None:
@@ -585,9 +710,6 @@ async def remove_playlist_from_market(playlist_id: int) -> bool:
         await conn.commit()
         return True
 
-# ============================================================
-# ОБНОВЛЁННЫЙ TOGGLE_LIKE (с поддержкой position)
-# ============================================================
 async def toggle_like(user_id: int, track_id: int, position: int = 0) -> bool:
     async with get_db() as conn:
         async with conn.execute("SELECT 1 FROM likes WHERE user_id = ? AND track_id = ?", (user_id, track_id)) as cursor:
@@ -601,9 +723,6 @@ async def toggle_like(user_id: int, track_id: int, position: int = 0) -> bool:
             await conn.commit()
             return True
 
-# ============================================================
-# ОБНОВЛЁННЫЙ GET_USER_LIKED_TRACKS (сортировка по position)
-# ============================================================
 async def get_user_liked_tracks(user_id: int) -> list[dict[str, Any]]:
     async with get_db() as conn:
         async with conn.execute("""
@@ -708,9 +827,6 @@ async def get_trending_tracks(limit: int = 5) -> list[dict[str, Any]]:
         ) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
-# ============================================================
-# ОБНОВЛЁННЫЙ GET_TRENDING_ARTISTS (с нормализацией)
-# ============================================================
 async def get_trending_artists(limit: int = 6) -> list[dict[str, Any]]:
     async with get_db() as conn:
         async with conn.execute("SELECT * FROM tracks WHERE status = 'approved'") as cursor:
@@ -737,9 +853,6 @@ async def get_trending_artists(limit: int = 6) -> list[dict[str, Any]]:
     sorted_artists = sorted(artist_stats.values(), key=lambda x: x["total_downloads"], reverse=True)
     return sorted_artists[:limit]
 
-# ============================================================
-# ОБНОВЛЁННЫЙ GET_TRACKS_BY_ARTIST (с нормализацией)
-# ============================================================
 async def get_tracks_by_artist(artist_name: str, limit: int = 20) -> list[dict[str, Any]]:
     target_norm = normalize_artist(artist_name)
     
@@ -799,9 +912,6 @@ async def buy_theme(user_id: int, theme_name: str, price: int) -> dict:
             
             return {"ok": True, "msg": "Тема успешно куплена!", "unlocked": unlocked}
 
-# ============================================================
-# "МОЯ ВОЛНА"
-# ============================================================
 async def get_wave_recommendations(user_id: int, limit: int = 20) -> list[dict[str, Any]]:
     async with get_db() as conn:
         async with conn.execute("""

@@ -20,6 +20,7 @@ from aiogram.types import (
     InlineQuery, InlineQueryResultCachedAudio
 )
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramRetryAfter
 from dotenv import load_dotenv
 
 from backend.config import TELEGRAM_BOT_TOKEN, ADMIN_ID
@@ -34,7 +35,8 @@ from backend.database import (
     create_user_playlist, get_user_playlist_by_title, add_track_to_playlist,
     set_playlist_trailer, set_playlist_custom_cover,
     set_track_file_id, get_tracks_without_file_id,
-    toggle_like, get_user_playlists
+    toggle_like, get_user_playlists, is_premium_active,
+    reserve_downloads, refund_downloads
 )
 from backend.parser import detect_source, parse_playlist, get_yandex_client, parse_single_track
 from backend.downloader import (
@@ -55,7 +57,7 @@ load_dotenv()
 BASE_DIR: Path = Path(__file__).resolve().parent
 UPLOADS_DIR: Path = BASE_DIR / "uploads"
 TRAILERS_DIR: Path = UPLOADS_DIR / "trailers"
-WEBAPP_STUB_URL: str = "https://glaring-agreeably-sharply.ngrok-free.dev"
+WEBAPP_STUB_URL: str = "https://solomon-anywhere-somebody-employee.trycloudflare.com"
 
 session = AiohttpSession(timeout=300)
 bot: Bot = Bot(token=TELEGRAM_BOT_TOKEN, session=session)
@@ -79,7 +81,7 @@ async def _ensure_user(message: Message) -> dict:
     return await get_user(_telegram_id(message))
 
 def _is_premium(user: dict) -> bool:
-    return bool(user.get("is_premium"))
+    return is_premium_active(user)
 
 async def _notify_level_up(message: Message, result: dict):
     if result.get("leveled_up"):
@@ -95,9 +97,6 @@ def format_time(seconds: int) -> str:
     if m > 0: return f"{m} мин {s} сек"
     return f"{s} сек"
 
-# ============================================================
-# УМНАЯ ВСТАВКА: парсер строк "Исполнитель - Название"
-# ============================================================
 def parse_smart_line(raw: str) -> dict | None:
     ZW_RE   = re.compile(r'[\u200b-\u200f\u2060\ufeff]')
     URL_RE  = re.compile(r'(?:https?://|www\.|t\.me/)\S+', re.I)
@@ -124,8 +123,6 @@ def parse_smart_line(raw: str) -> dict | None:
     if len(parts) == 2:
         return {"artist": parts[0].strip(), "title": parts[1].strip()}
     return {"artist": "Unknown", "title": s}
-
-# ============================================================
 
 def get_audio_info(file_path: Path) -> tuple[int, int]:
     if not MUTAGEN_AVAILABLE: return 0, 0
@@ -159,6 +156,23 @@ async def create_preview_audio(file_path: Path, duration: int) -> Path | None:
     except Exception as e:
         log(f"Ошибка создания превью: {e}")
         return None
+
+# ============================================================
+# БЕЗОПАСНАЯ ОТПРАВКА СООБЩЕНИЙ (не роняет воркер)
+# ============================================================
+async def safe_send(chat_id: int, text: str, **kw) -> None:
+    """Уведомление, которое никогда не роняет воркер (блокировка бота, flood, сеть)."""
+    for _ in range(2):
+        try:
+            await bot.send_message(chat_id, text, **kw)
+            return
+        except TelegramRetryAfter as e:
+            try: await asyncio.sleep(e.retry_after + 1)
+            except asyncio.CancelledError: raise
+        except Exception as e:
+            log(f"safe_send({chat_id}): {e!r}")
+            return
+# ============================================================
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject) -> None:
@@ -244,107 +258,139 @@ async def process_successful_payment(message: Message) -> None:
     await give_premium(int(user["id"]), 30)
     await message.answer("🎉 **Оплата прошла успешно!**\n\nТебе активирован Премиум на 30 дней.")
 
-# --- ОЧЕРЕДЬ СКАЧИВАНИЯ ---
+# ============================================================
+# ОЧЕРЕДЬ СКАЧИВАНИЯ (безопасный воркер с таймаутом)
+# ============================================================
 download_queue = asyncio.Queue()
+
+async def process_task(task_data):
+    """Обработка одного трека. Все сообщения через safe_send, чтобы не ронять воркер."""
+    user_id, tg_id = task_data['user_id'], task_data['tg_id']
+    artist, title = task_data['artist'], task_data['title']
+    orig_dur = task_data.get('original_duration', 0)
+    imp_src = task_data.get('import_source', 'unknown')
+    pending_playlist_id = task_data.get('pending_playlist_id')
+    pending_position = task_data.get('pending_position', 0)
+    direct_url = task_data.get('direct_url')
+    skip_soundcloud = task_data.get('skip_soundcloud', False)
+
+    try:
+        if direct_url:
+            file_path, err_type, source_url = await download_track_from_direct_url(direct_url, artist, title)
+        elif skip_soundcloud:
+            file_path, err_type, source_url = None, "skipped_sc", None
+        else:
+            file_path, err_type, source_url = await download_track_from_youtube(artist, title)
+
+        if not file_path:
+            log(f"Пробую Hitmo для: {artist} - {title}")
+            file_path, err_type, source_url = await download_from_hitmo(artist, title, UPLOADS_DIR)
+
+        if file_path:
+            await asyncio.to_thread(ensure_track_has_cover, str(file_path), artist, title)
+            await asyncio.to_thread(fix_audio_tags, file_path, artist, title)
+            bitrate, duration = await asyncio.to_thread(get_audio_info, Path(file_path))
+            if duration < 60:
+                Path(file_path).unlink()
+                await safe_send(tg_id, f"❌ Пропущено (слишком короткий трек): {title}")
+                await refund_downloads(user_id, 1)
+            else:
+                detected_source = "hitmo" if "hitmo" in (source_url or "").lower() else "soundcloud"
+
+                new_track = await upload_track(
+                    user_id=user_id, title=title, artist=artist,
+                    file_path=file_path, source=detected_source,
+                    bitrate=bitrate, duration=duration,
+                    original_duration=orig_dur, import_source=imp_src,
+                    pending_playlist_id=pending_playlist_id,
+                    pending_position=pending_position,
+                    source_url=source_url
+                )
+                await safe_send(tg_id, f"✅ Скачано: {title}")
+                await add_points(user_id, 5, "import_track")
+                # Лимит уже зарезервирован через reserve_downloads — здесь НЕ увеличиваем
+
+                duration_diff = abs(duration - orig_dur) if orig_dur > 0 else 0
+
+                if tg_id == ADMIN_ID and duration_diff <= 15:
+                    await update_track_status(new_track["id"], "approved", user_id)
+
+                if task_data.get('add_to_liked') and new_track:
+                    pos = task_data.get('pending_position', 0)
+                    await toggle_like(user_id, new_track["id"], position=pos)
+        else:
+            log_msg = "🔒 Защищено DRM" if err_type == "drm" else "❌ Не удалось найти"
+            await safe_send(tg_id, f"{log_msg}: {title}. Добавлено в очередь на ручную модерацию.")
+
+            await upload_track(
+                user_id=user_id, title=title, artist=artist,
+                file_path="", source="failed_download",
+                bitrate=0, duration=0,
+                original_duration=orig_dur, import_source=imp_src,
+                pending_playlist_id=pending_playlist_id,
+                pending_position=pending_position
+            )
+            # Трек не скачался → возвращаем зарезервированный лимит
+            await refund_downloads(user_id, 1)
+    except ValueError:
+        await safe_send(tg_id, f"⏩ Пропущено (дубликат): {title}")
+        await refund_downloads(user_id, 1)
+    except asyncio.CancelledError:
+        # Отменён по таймауту — refund сделает download_worker
+        raise
+    except Exception as e:
+        log(f"[process_task] Ошибка: {e}")
+        await safe_send(tg_id, f"❌ Ошибка сервера: {title}")
+        await refund_downloads(user_id, 1)
 
 async def download_worker():
     log("Воркер скачивания запущен...")
     while True:
         task_data = await download_queue.get()
-        user_id, tg_id = task_data['user_id'], task_data['tg_id']
-        artist, title = task_data['artist'], task_data['title']
-        orig_dur = task_data.get('original_duration', 0)
-        imp_src = task_data.get('import_source', 'unknown')
-        pending_playlist_id = task_data.get('pending_playlist_id')
-        pending_position = task_data.get('pending_position', 0)
-        direct_url = task_data.get('direct_url')
-        skip_soundcloud = task_data.get('skip_soundcloud', False)
-
         try:
-            if direct_url:
-                file_path, err_type, source_url = await download_track_from_direct_url(direct_url, artist, title)
-            elif skip_soundcloud:
-                file_path, err_type, source_url = None, "skipped_sc", None
-            else:
-                file_path, err_type, source_url = await download_track_from_youtube(artist, title)
-
-            if not file_path:
-                log(f"Пробую Hitmo для: {artist} - {title}")
-                file_path, err_type, source_url = await download_from_hitmo(artist, title, UPLOADS_DIR)
-
-            if file_path:
-                await asyncio.to_thread(ensure_track_has_cover, str(file_path), artist, title)
-                await asyncio.to_thread(fix_audio_tags, file_path, artist, title)
-                bitrate, duration = await asyncio.to_thread(get_audio_info, Path(file_path))
-                if duration < 60:
-                    Path(file_path).unlink()
-                    await bot.send_message(tg_id, f"❌ Пропущено (слишком короткий трек): {title}")
-                else:
-                    detected_source = "hitmo" if "hitmo" in (source_url or "").lower() else "soundcloud"
-                    
-                    new_track = await upload_track(
-                        user_id=user_id, title=title, artist=artist, 
-                        file_path=file_path, source=detected_source,
-                        bitrate=bitrate, duration=duration,
-                        original_duration=orig_dur, import_source=imp_src,
-                        pending_playlist_id=pending_playlist_id,
-                        pending_position=pending_position,
-                        source_url=source_url
-                    )
-                    await bot.send_message(tg_id, f"✅ Скачано: {title}")
-                    await add_points(user_id, 5, "import_track")
-                    
-                    # Списание лимита только за успешно скачанный трек
-                    await increment_download_count(user_id, 1)
-                    
-                    duration_diff = abs(duration - orig_dur) if orig_dur > 0 else 0
-                    
-                    if tg_id == ADMIN_ID and duration_diff <= 15:
-                        await update_track_status(new_track["id"], "approved", user_id)
-                    
-                    if task_data.get('add_to_liked') and new_track:
-                        pos = task_data.get('pending_position', 0)
-                        await toggle_like(user_id, new_track["id"], position=pos)
-            else:
-                log_msg = "🔒 Защищено DRM" if err_type == "drm" else "❌ Не удалось найти"
-                await bot.send_message(tg_id, f"{log_msg}: {title}. Добавлено в очередь на ручную модерацию.")
-                
-                await upload_track(
-                    user_id=user_id, title=title, artist=artist, 
-                    file_path="", source="failed_download",
-                    bitrate=0, duration=0,
-                    original_duration=orig_dur, import_source=imp_src,
-                    pending_playlist_id=pending_playlist_id,
-                    pending_position=pending_position
-                )
-        except ValueError:
-             await bot.send_message(tg_id, f"⏩ Пропущено (дубликат): {title}")
+            await asyncio.wait_for(process_task(task_data), timeout=600)
+        except asyncio.TimeoutError:
+            log(f"[Воркер] Таймаут обработки: {task_data.get('title')}")
+            try:
+                await refund_downloads(task_data['user_id'], 1)
+                await safe_send(task_data['tg_id'], f"⏰ Таймаут при скачивании: {task_data.get('title')}")
+            except Exception as e:
+                log(f"[Воркер] Ошибка при обработке таймаута: {e}")
         except Exception as e:
-            log(f"[Воркер] Ошибка: {e}")
-            await bot.send_message(tg_id, f"❌ Ошибка сервера: {title}")
+            log(f"[Воркер] Ошибка: {type(e).__name__}: {e!r}")
+            try:
+                await refund_downloads(task_data['user_id'], 1)
+                await safe_send(task_data['tg_id'], f"❌ Не удалось обработать трек: {task_data.get('title')}")
+            except Exception as e2:
+                log(f"[Воркер] Ошибка при уведомлении: {e2}")
         finally:
             download_queue.task_done()
             await asyncio.sleep(1)
-            
+
             if task_data.get('is_last'):
                 if task_data.get('limit_reached'):
-                    await bot.send_message(tg_id, "⚠️ **Достигнут дневной лимит!**\nОстальные треки из плейлиста не были добавлены.\n\nПовысьте свой уровень или купите **Премиум**, чтобы снять все ограничения.")
+                    await safe_send(task_data['tg_id'], "⚠️ **Достигнут дневной лимит!**\nОстальные треки из плейлиста не были добавлены.\n\nПовысьте свой уровень или купите **Премиум**, чтобы снять все ограничения.")
                 else:
                     if task_data.get('is_single'):
-                        await bot.send_message(tg_id, "✅ Одиночный трек успешно скачан и добавлен в базу!")
+                        await safe_send(task_data['tg_id'], "✅ Одиночный трек успешно скачан и добавлен в базу!")
                     else:
-                        await bot.send_message(tg_id, "✅ Все треки из плейлиста успешно скачаны и добавлены в базу!")
+                        await safe_send(task_data['tg_id'], "✅ Все треки из плейлиста успешно скачаны и добавлены в базу!")
+# ============================================================
 
-# ============================================================
-# ФУНКЦИЯ ПОКАЗА МЕНЮ ВЫБОРА ПЛЕЙЛИСТА
-# ============================================================
 async def show_import_destination_menu(message: Message, user_id: int, tracks: list, is_single: bool = False, source_type: str = "unknown", direct_url: str = None, playlist_title: str = None):
+    # Если у пользователя уже было незавершённое меню — возвращаем прошлый резерв
+    existing = pending_imports.get(user_id)
+    if existing and existing.get("reserved_count", 0) > 0:
+        await refund_downloads(user_id, existing["reserved_count"])
+
+    reserved_count = len(tracks) if isinstance(tracks, list) else 1
     pending_imports[user_id] = {
         "tracks": tracks,
         "is_single": is_single,
         "source_type": source_type,
         "direct_url": direct_url,
-        "playlist_title": playlist_title
+        "playlist_title": playlist_title,
+        "reserved_count": reserved_count
     }
     
     playlists = await get_user_playlists(user_id)
@@ -383,7 +429,6 @@ async def show_import_destination_menu(message: Message, user_id: int, tracks: l
     )
     
     await message.answer(text, reply_markup=kb, parse_mode="Markdown")
-# ============================================================
 
 @dp.message(Command("import_text"))
 async def cmd_import_text(message: Message, command: CommandObject) -> None:
@@ -418,8 +463,13 @@ async def cmd_import_text(message: Message, command: CommandObject) -> None:
         await message.answer(f"ℹ️ Пропущено {already_in_db} треков (уже есть в базе).")
         
     tracks_to_import = parsed_tracks[:limit_info["remaining"]]
-    # Лимит списывается в download_worker только за успешно скачанные треки
-    
+
+    # Бронируем лимит заранее (атомарно)
+    granted = await reserve_downloads(int(user["id"]), len(tracks_to_import))
+    if granted == 0:
+        return await message.answer("⛔ Лимит скачиваний на сегодня исчерпан.")
+    tracks_to_import = tracks_to_import[:granted]
+
     await show_import_destination_menu(
         message, int(user["id"]), tracks=tracks_to_import, is_single=False, source_type="text_import"
     )
@@ -441,7 +491,11 @@ async def cmd_import(message: Message, command: CommandObject) -> None:
             try: src_type = detect_source(url)
             except ValueError: src_type = "direct"
 
-            # Лимит спишется в download_worker после успешного скачивания
+            # Бронируем 1 скачивание
+            granted = await reserve_downloads(int(user["id"]), 1)
+            if granted == 0:
+                return await message.answer("⛔ Лимит скачиваний на сегодня исчерпан.")
+
             await show_import_destination_menu(
                 message, int(user["id"]), tracks=[single_track], is_single=True, source_type=src_type, direct_url=url
             )
@@ -473,9 +527,13 @@ async def cmd_import(message: Message, command: CommandObject) -> None:
 
         if already_in_db > 0:
             await message.answer(f"ℹ️ Пропущено {already_in_db} треков (уже есть в базе).")
-            
-        # Лимит списывается в download_worker только за успешно скачанные треки
-        
+
+        # Бронируем лимит заранее (атомарно)
+        granted = await reserve_downloads(int(user["id"]), len(tracks_to_import))
+        if granted == 0:
+            return await message.answer("⛔ Лимит скачиваний на сегодня исчерпан.")
+        tracks_to_import = tracks_to_import[:granted]
+
         await show_import_destination_menu(
             message, int(user["id"]), tracks=tracks_to_import, is_single=False, source_type=source_type, playlist_title=playlist_title
         )
@@ -485,10 +543,6 @@ async def cmd_import(message: Message, command: CommandObject) -> None:
         log(f"Ошибка /import: {exc}")
         await message.answer("Не удалось импортировать плейлист.")
 
-
-# ============================================================
-# ИМПОРТ АРТИСТА С HITMO (умная пагинация + пред-фильтр дубликатов)
-# ============================================================
 @dp.message(Command("import_artist_hitmo"))
 async def cmd_import_artist_hitmo(message: Message, command: CommandObject) -> None:
     user = await _ensure_user(message)
@@ -511,7 +565,6 @@ async def cmd_import_artist_hitmo(message: Message, command: CommandObject) -> N
         tracks = await parse_artist_page_hitmo(url)
         all_tracks.extend(tracks)
         
-    # --- Убираем дубликаты по URL + проверяем что уже есть в базе ---
     seen_urls = set()
     unique_tracks = []
     already_in_db = 0
@@ -521,19 +574,16 @@ async def cmd_import_artist_hitmo(message: Message, command: CommandObject) -> N
             continue
         seen_urls.add(t['url'])
         
-        # --- ПРОВЕРКА ДУБЛИКАТОВ В БАЗЕ ---
         artist = t.get('artist', 'Unknown')
         title = t.get('title', 'Unknown')
         existing_id = await check_track_exists(artist, title)
         
         if existing_id and existing_id > 0:
             already_in_db += 1
-            continue  # Уже есть в базе — пропускаем
-        # -----------------------------------
+            continue
         
         t['skip_soundcloud'] = True
         unique_tracks.append(t)
-    # ------------------------------------------------------------------
             
     if not unique_tracks:
         if already_in_db > 0:
@@ -548,23 +598,22 @@ async def cmd_import_artist_hitmo(message: Message, command: CommandObject) -> N
     
     if already_in_db > 0:
         await message.answer(f"ℹ️ Пропущено {already_in_db} треков (уже есть в базе).")
-    
-    if len(unique_tracks) > remaining:
-        await status_msg.edit_text(f"⚠️ Найдено {len(unique_tracks)} новых треков, но твой лимит позволяет скачать только {remaining}.")
+
+    # Бронируем лимит заранее (атомарно)
+    granted = await reserve_downloads(int(user["id"]), len(tracks_to_import))
+    if granted == 0:
+        return await status_msg.edit_text("⛔ Лимит скачиваний на сегодня исчерпан.")
+    tracks_to_import = tracks_to_import[:granted]
+
+    if len(unique_tracks) > granted:
+        await status_msg.edit_text(f"⚠️ Найдено {len(unique_tracks)} новых треков, но твой лимит позволяет скачать только {granted}.")
     else:
         await status_msg.edit_text(f"✅ Найдено {len(unique_tracks)} новых треков. Начинаю импорт...")
-        
-    # Лимит списывается в download_worker только за успешно скачанные треки
-    
+
     await show_import_destination_menu(
         message, int(user["id"]), tracks=tracks_to_import, is_single=False, source_type="hitmo_artist"
     )
-# ============================================================
 
-
-# ============================================================
-# ОБРАБОТЧИКИ КНОПОК ВЫБОРА ПЛЕЙЛИСТА
-# ============================================================
 @dp.callback_query(F.data.startswith("import_dest_"))
 async def process_import_destination(callback: CallbackQuery):
     user = await get_user(callback.from_user.id)
@@ -622,7 +671,12 @@ async def process_import_destination(callback: CallbackQuery):
 @dp.callback_query(F.data == "import_dest_cancel")
 async def cancel_import(callback: CallbackQuery):
     user = await get_user(callback.from_user.id)
-    if int(user["id"]) in pending_imports:
+    data = pending_imports.get(int(user["id"]))
+    if data:
+        # Возвращаем зарезервированный лимит
+        reserved = data.get("reserved_count", 0)
+        if reserved > 0:
+            await refund_downloads(int(user["id"]), reserved)
         del pending_imports[int(user["id"])]
     await callback.message.edit_text("❌ Импорт отменен.")
 
@@ -656,7 +710,6 @@ async def execute_import(message: Message, user_id: int, tg_id: int, playlist_id
         await download_queue.put(task)
         
     del pending_imports[user_id]
-# ============================================================
 
 @dp.message(Command("search"))
 async def cmd_search(message: Message, command: CommandObject) -> None:
@@ -702,7 +755,6 @@ async def cmd_get_track(message: Message) -> None:
     except Exception as e:
         log(f"Ошибка /get_track: {e}")
 
-# --- АДМИН-ПАНЕЛЬ ---
 @dp.message(Command("admin"))
 async def cmd_admin_panel(message: Message) -> None:
     if message.from_user.id != ADMIN_ID: return
@@ -838,7 +890,6 @@ async def cmd_cache_all(message: Message):
             
     await status_msg.edit_text(f"✅ **Обработка завершена!**\n\nУспешно: {success_count}\nОшибок: {fail_count}\n\nТеперь все эти треки имеют обложки и доступны в инлайн-поиске!", parse_mode="Markdown")
 
-# --- МОДЕРАЦИЯ ---
 async def _send_next_moderation_track(message: Message, admin_internal_id: int):
     tracks = await get_pending_tracks(limit=1)
     if not tracks: return await message.answer("🎉 Очередь на модерацию пуста!")
@@ -1084,7 +1135,6 @@ async def process_moderation(callback: CallbackQuery):
 
     await _send_next_moderation_track(callback.message, int(admin_user["id"]))
 
-# --- ЛОГИКА ДЛЯ ТРЕЙЛЕРОВ ---
 async def process_trailer(message: Message, file_obj: Any):
     try:
         text = message.reply_to_message.text
@@ -1117,7 +1167,6 @@ async def process_trailer(message: Message, file_obj: Any):
         log(f"Ошибка сохранения трейлера: {e}")
         await message.answer("❌ Ошибка при сохранении трейлера. Попробуй еще раз.")
 
-# --- ОБРАБОТЧИК АУДИО ---
 @dp.message(F.audio)
 async def handle_audio(message: Message) -> None:
     if message.reply_to_message and message.reply_to_message.text and "ID:" in message.reply_to_message.text:
@@ -1214,7 +1263,6 @@ async def handle_audio(message: Message) -> None:
         log(f"Ошибка обработки аудио: {exc}")
         await message.answer("Не удалось отправить трек.")
 
-# --- ОБРАБОТЧИК ДОКУМЕНТОВ ---
 @dp.message(F.document)
 async def handle_document(message: Message) -> None:
     if message.reply_to_message and message.reply_to_message.text:
@@ -1248,7 +1296,6 @@ async def handle_document(message: Message) -> None:
             
     await message.answer("Я пока учусь! Используй /help")
 
-# --- ОБРАБОТЧИК ФОТО (ОБЛОЖКИ ПЛЕЙЛИСТОВ) ---
 @dp.message(F.photo)
 async def handle_photo(message: Message) -> None:
     if message.reply_to_message and message.reply_to_message.text and "ID:" in message.reply_to_message.text and "обложки" in message.reply_to_message.text:
@@ -1280,7 +1327,6 @@ async def handle_photo(message: Message) -> None:
             log(f"Ошибка сохранения обложки: {e}")
             await message.answer("❌ Ошибка при сохранении обложки. Попробуй еще раз.")
 
-# --- ОБРАБОТЧИК ТЕКСТА ---
 @dp.message(F.text)
 async def handle_text(message: Message) -> None:
     user = await _ensure_user(message)
@@ -1334,7 +1380,6 @@ async def handle_text(message: Message) -> None:
 
     await message.answer("Я пока учусь! Используй /help")
 
-# --- INLINE-РЕЖИМ ---
 @dp.inline_query()
 async def inline_query_handler(inline_query: InlineQuery) -> None:
     query = inline_query.query.strip()

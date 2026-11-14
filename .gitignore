@@ -15,4 +15,6 @@ ffprobe.exe
 *.pyc
 ngrok.exe
 *.exe
-proxiec.txt
+proxies.txt
+*.7z
+*.zip

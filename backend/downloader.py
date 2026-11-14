@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOADS_DIR = BASE_DIR / "uploads"
-FFMPEG_PATH = BASE_DIR / "ffmpeg.exe"
+FFMPEG_PATH = "ffmpeg"
 TRUSTED_FILE = Path(__file__).resolve().parent / "trusted_artists.json"
 PROXIES_FILE = Path(__file__).resolve().parent / "proxies.txt"
 
