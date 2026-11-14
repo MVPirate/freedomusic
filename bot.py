@@ -5,6 +5,7 @@ import asyncio
 import re
 import sys
 import subprocess
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -32,13 +33,15 @@ from backend.database import (
     update_track_metadata, delete_track, replace_track_file,
     create_user_playlist, get_user_playlist_by_title, add_track_to_playlist,
     set_playlist_trailer, set_playlist_custom_cover,
-    set_track_file_id, get_tracks_without_file_id
+    set_track_file_id, get_tracks_without_file_id,
+    toggle_like, get_user_playlists
 )
 from backend.parser import detect_source, parse_playlist, get_yandex_client, parse_single_track
 from backend.downloader import (
     download_track_from_youtube, fix_audio_tags, FFMPEG_PATH, find_soundcloud_link,
     download_from_soundcloud_url, ensure_track_has_cover, download_track_from_direct_url
 )
+from backend.hitmo_parser import download_from_hitmo, parse_artist_page_hitmo
 
 try:
     from mutagen.mp3 import MP3
@@ -52,7 +55,7 @@ load_dotenv()
 BASE_DIR: Path = Path(__file__).resolve().parent
 UPLOADS_DIR: Path = BASE_DIR / "uploads"
 TRAILERS_DIR: Path = UPLOADS_DIR / "trailers"
-WEBAPP_STUB_URL: str = "https://flattery-defuse-yogurt.ngrok-free.dev"
+WEBAPP_STUB_URL: str = "https://glaring-agreeably-sharply.ngrok-free.dev"
 
 session = AiohttpSession(timeout=300)
 bot: Bot = Bot(token=TELEGRAM_BOT_TOKEN, session=session)
@@ -60,6 +63,9 @@ dp: Dispatcher = Dispatcher()
 
 waiting_for_replacement = {}
 processing_full_tracks = set()
+
+pending_imports = {}
+waiting_for_new_playlist = {}
 
 def log(text: str) -> None:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -88,6 +94,38 @@ def format_time(seconds: int) -> str:
     m, s = divmod(seconds, 60)
     if m > 0: return f"{m} мин {s} сек"
     return f"{s} сек"
+
+# ============================================================
+# УМНАЯ ВСТАВКА: парсер строк "Исполнитель - Название"
+# ============================================================
+def parse_smart_line(raw: str) -> dict | None:
+    ZW_RE   = re.compile(r'[\u200b-\u200f\u2060\ufeff]')
+    URL_RE  = re.compile(r'(?:https?://|www\.|t\.me/)\S+', re.I)
+    NUM_RE  = re.compile(r'^\s*\d{1,3}\s*[.)]\s+')
+    TIME_RE = re.compile(r'[\s(\[]*\b\d{1,2}:\d{2}(?::\d{2})?\b[\s)\]]*$')
+    JUNK_RE = re.compile(
+        r'\s*[(\[][^()\[\]]*?\b(?:mp3|flac|wav|kbps|official\s+(?:video|audio)|lyrics?|'
+        r'clip|hd|hq|4k|explicit|текст|клип|скачать)\b[^()\[\]]*?[)\]]', re.I)
+    PROD_RE = re.compile(r'\s*[(\[]\s*prod\.?(?:\s*by)?\b[^)\]]*[)\]]', re.I)
+    FEAT_RE = re.compile(
+        r'\s*(?:[(\[]\s*)?\b(?:feat\.?|ft\.?|featuring|при\s+уч\.?|с\s+уч\.?)\s+'
+        r'([^)\]]+?)\s*(?:[)\]]|$)', re.I)
+    SEP_RE  = re.compile(r'\s+[-–—―−]\s+')
+
+    s = unicodedata.normalize('NFKC', raw)
+    for rx in (ZW_RE, URL_RE, NUM_RE, TIME_RE, JUNK_RE, PROD_RE):
+        s = rx.sub('', s)
+    s = ' '.join(s.split()).strip(' -–—·•|')
+    
+    if len(s) < 2 or not re.search(r'\w', s): return None
+    s = FEAT_RE.sub('', s)
+        
+    parts = SEP_RE.split(s, maxsplit=1)
+    if len(parts) == 2:
+        return {"artist": parts[0].strip(), "title": parts[1].strip()}
+    return {"artist": "Unknown", "title": s}
+
+# ============================================================
 
 def get_audio_info(file_path: Path) -> tuple[int, int]:
     if not MUTAGEN_AVAILABLE: return 0, 0
@@ -144,7 +182,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
 @dp.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await _ensure_user(message)
-    await message.answer("Команды:\n/import <ссылка>\n/search <название>\n/buypremium\n/daily\n/invite\n/profile")
+    await message.answer("Команды:\n/import <ссылка>\n/import_text <список>\n/import_artist_hitmo <ссылка>\n/search <название>\n/buypremium\n/daily\n/invite\n/profile")
 
 @dp.message(Command("profile"))
 async def cmd_profile(message: Message) -> None:
@@ -152,8 +190,18 @@ async def cmd_profile(message: Message) -> None:
         user = await _ensure_user(message)
         is_paid = _is_premium(user)
         limit_info = await check_download_limit(int(user["id"]), is_paid)
-        limit_text = "∞ (Премиум)" if is_paid else f"{limit_info.get('used', 0)}/{limit_info.get('limit', 5)}"
-        await message.answer(f"👤 Профиль\nID: {user['telegram_id']}\nПоинты: {user.get('points', 0)}\nУровень: {user.get('level', 'Новичок')}\nРефералов: {user.get('referrals_count', 0)}\nСкачиваний сегодня: {limit_text}\nПремиум: {'да' if is_paid else 'нет'}")
+        
+        limit_text = "∞ (Премиум)" if is_paid else f"{limit_info.get('remaining', 0)}/{limit_info.get('limit', 5)}"
+        
+        await message.answer(
+            f"👤 Профиль\n"
+            f"ID: {user['telegram_id']}\n"
+            f"Поинты: {user.get('points', 0)}\n"
+            f"Уровень: {user.get('level', 'Новичок')}\n"
+            f"Рефералов: {user.get('referrals_count', 0)}\n"
+            f"Скачиваний осталось: {limit_text}\n"
+            f"Премиум: {'да' if is_paid else 'нет'}"
+        )
     except Exception as exc:
         log(f"Ошибка /profile: {exc}")
         await message.answer("Ошибка загрузки профиля.")
@@ -210,22 +258,33 @@ async def download_worker():
         pending_playlist_id = task_data.get('pending_playlist_id')
         pending_position = task_data.get('pending_position', 0)
         direct_url = task_data.get('direct_url')
+        skip_soundcloud = task_data.get('skip_soundcloud', False)
 
         try:
             if direct_url:
                 file_path, err_type, source_url = await download_track_from_direct_url(direct_url, artist, title)
+            elif skip_soundcloud:
+                file_path, err_type, source_url = None, "skipped_sc", None
             else:
                 file_path, err_type, source_url = await download_track_from_youtube(artist, title)
+
+            if not file_path:
+                log(f"Пробую Hitmo для: {artist} - {title}")
+                file_path, err_type, source_url = await download_from_hitmo(artist, title, UPLOADS_DIR)
+
             if file_path:
+                await asyncio.to_thread(ensure_track_has_cover, str(file_path), artist, title)
                 await asyncio.to_thread(fix_audio_tags, file_path, artist, title)
                 bitrate, duration = await asyncio.to_thread(get_audio_info, Path(file_path))
                 if duration < 60:
                     Path(file_path).unlink()
                     await bot.send_message(tg_id, f"❌ Пропущено (слишком короткий трек): {title}")
                 else:
-                    await upload_track(
+                    detected_source = "hitmo" if "hitmo" in (source_url or "").lower() else "soundcloud"
+                    
+                    new_track = await upload_track(
                         user_id=user_id, title=title, artist=artist, 
-                        file_path=file_path, source="soundcloud", 
+                        file_path=file_path, source=detected_source,
                         bitrate=bitrate, duration=duration,
                         original_duration=orig_dur, import_source=imp_src,
                         pending_playlist_id=pending_playlist_id,
@@ -234,6 +293,18 @@ async def download_worker():
                     )
                     await bot.send_message(tg_id, f"✅ Скачано: {title}")
                     await add_points(user_id, 5, "import_track")
+                    
+                    # Списание лимита только за успешно скачанный трек
+                    await increment_download_count(user_id, 1)
+                    
+                    duration_diff = abs(duration - orig_dur) if orig_dur > 0 else 0
+                    
+                    if tg_id == ADMIN_ID and duration_diff <= 15:
+                        await update_track_status(new_track["id"], "approved", user_id)
+                    
+                    if task_data.get('add_to_liked') and new_track:
+                        pos = task_data.get('pending_position', 0)
+                        await toggle_like(user_id, new_track["id"], position=pos)
             else:
                 log_msg = "🔒 Защищено DRM" if err_type == "drm" else "❌ Не удалось найти"
                 await bot.send_message(tg_id, f"{log_msg}: {title}. Добавлено в очередь на ручную модерацию.")
@@ -264,128 +335,328 @@ async def download_worker():
                     else:
                         await bot.send_message(tg_id, "✅ Все треки из плейлиста успешно скачаны и добавлены в базу!")
 
+# ============================================================
+# ФУНКЦИЯ ПОКАЗА МЕНЮ ВЫБОРА ПЛЕЙЛИСТА
+# ============================================================
+async def show_import_destination_menu(message: Message, user_id: int, tracks: list, is_single: bool = False, source_type: str = "unknown", direct_url: str = None, playlist_title: str = None):
+    pending_imports[user_id] = {
+        "tracks": tracks,
+        "is_single": is_single,
+        "source_type": source_type,
+        "direct_url": direct_url,
+        "playlist_title": playlist_title
+    }
+    
+    playlists = await get_user_playlists(user_id)
+    editable_playlists = [pl for pl in playlists if not pl.get("original_playlist_id")]
+    
+    kb_buttons = []
+    
+    suggested_playlist_exists = False
+    if playlist_title:
+        for pl in editable_playlists:
+            if pl['title'].lower() == playlist_title.lower():
+                suggested_playlist_exists = True
+                break
+                
+    kb_buttons.append([InlineKeyboardButton(text="➕ Создать новый плейлист", callback_data="import_dest_new")])
+    
+    if playlist_title and not suggested_playlist_exists:
+        short_title = playlist_title[:20] + ('...' if len(playlist_title) > 20 else '')
+        kb_buttons.append([InlineKeyboardButton(text=f"📥 Сохранить как «{short_title}»", callback_data="import_dest_suggested")])
+        
+    kb_buttons.append([InlineKeyboardButton(text="❤️ Мне нравится", callback_data="import_dest_liked")])
+    
+    kb_buttons.append([InlineKeyboardButton(text="🌐 Только в базу (без плейлиста)", callback_data="import_dest_db_only")])
+    
+    for pl in editable_playlists:
+        kb_buttons.append([InlineKeyboardButton(text=f"📁 {pl['title']}", callback_data=f"import_dest_pl_{pl['id']}")])
+        
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+    
+    total_tracks = len(tracks) if isinstance(tracks, list) else 1
+    
+    text = (
+        f"📦 **Импорт подготовлен!**\n"
+        f"Треков к загрузке: {total_tracks}\n\n"
+        f"👇 **Куда добавить эти треки?**"
+    )
+    
+    await message.answer(text, reply_markup=kb, parse_mode="Markdown")
+# ============================================================
+
+@dp.message(Command("import_text"))
+async def cmd_import_text(message: Message, command: CommandObject) -> None:
+    user = await _ensure_user(message)
+    text = (command.args or "").strip()
+    
+    if not text:
+        return await message.answer("📝 **Умная вставка**\n\nСкопируй список треков и отправь:\n`/import_text Исполнитель - Название`")
+
+    limit_info = await check_download_limit(int(user["id"]), _is_premium(user))
+    if not limit_info["allowed"]: return await message.answer(f"⛔ {limit_info['msg']}")
+    
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    parsed_tracks = []
+    already_in_db = 0
+    
+    for line in lines:
+        track = parse_smart_line(line)
+        if track:
+            existing_id = await check_track_exists(track["artist"], track["title"])
+            if existing_id and existing_id > 0:
+                already_in_db += 1
+            else:
+                if existing_id == -1:
+                    track['skip_soundcloud'] = True
+                parsed_tracks.append(track)
+                
+    if not parsed_tracks:
+        return await message.answer("🤷‍♂️ Не найдено новых треков для импорта.")
+
+    if already_in_db > 0:
+        await message.answer(f"ℹ️ Пропущено {already_in_db} треков (уже есть в базе).")
+        
+    tracks_to_import = parsed_tracks[:limit_info["remaining"]]
+    # Лимит списывается в download_worker только за успешно скачанные треки
+    
+    await show_import_destination_menu(
+        message, int(user["id"]), tracks=tracks_to_import, is_single=False, source_type="text_import"
+    )
+
 @dp.message(Command("import"))
 async def cmd_import(message: Message, command: CommandObject) -> None:
     try:
         user = await _ensure_user(message)
         url = (command.args or "").strip()
         if not url: return await message.answer("Укажи ссылку: /import <ссылка>")
-        is_paid = _is_premium(user)
-        limit_info = await check_download_limit(int(user["id"]), is_paid)
+        
+        limit_info = await check_download_limit(int(user["id"]), _is_premium(user))
         if not limit_info["allowed"]: return await message.answer(f"⛔ {limit_info['msg']}")
         
         remaining_limit = limit_info["remaining"]
 
-        # ПРОВЕРКА НА ОДИНОЧНЫЙ ТРЕК
         single_track = await asyncio.to_thread(parse_single_track, url)
         if single_track:
-            artist, title = single_track['artist'], single_track['title']
-            
-            # Создаем или находим плейлист "Мои загрузки" для таких треков
-            pl_title = "Синглы и загрузки"
-            existing_pl = await get_user_playlist_by_title(int(user["id"]), pl_title)
-            if existing_pl:
-                new_pl_id = existing_pl["id"]
-            else:
-                new_pl = await create_user_playlist(int(user["id"]), pl_title)
-                new_pl_id = new_pl["id"]
-
-            await message.answer(f"🎵 Найден одиночный трек: **{artist} - {title}**\n⏳ Добавляю в очередь...")
-            
-            await increment_download_count(int(user["id"]), 1)
-            
             try: src_type = detect_source(url)
             except ValueError: src_type = "direct"
 
-            task_data = {
-                'user_id': int(user["id"]), 'tg_id': message.from_user.id,
-                'artist': artist, 'title': title,
-                'original_duration': single_track.get('duration', 0), 'import_source': src_type,
-                'is_last': True, 'limit_reached': False,
-                'pending_playlist_id': new_pl_id,
-                'pending_position': 0,
-                'is_single': True,
-            }
-            
-            # Если это SoundCloud — качаем напрямую по ссылке.
-            # Яндекс и ВК — качаем через поиск на SoundCloud (по названию).
-            if single_track.get("source") == "soundcloud":
-                task_data['direct_url'] = url
-                
-            await download_queue.put(task_data)
-            return # Выходим, чтобы не запускать парсинг плейлиста
+            # Лимит спишется в download_worker после успешного скачивания
+            await show_import_destination_menu(
+                message, int(user["id"]), tracks=[single_track], is_single=True, source_type=src_type, direct_url=url
+            )
+            return
 
-        # Если это не одиночный трек, идем дальше по старой логике
         await message.answer(f"🔎 Сканирую плейлист... (Доступно сегодня: {remaining_limit})")
-        
         tracks, playlist_title = await asyncio.to_thread(parse_playlist, url)
         source_type = detect_source(url)
         if not tracks: return await message.answer("Треков не найдено.")
         
-        existing_pl = await get_user_playlist_by_title(int(user["id"]), playlist_title)
-        if existing_pl:
-            new_pl_id = existing_pl["id"]
-            await message.answer(f"📁 Найден существующий плейлист **{playlist_title}**. Дополняю его...")
-        else:
-            new_pl = await create_user_playlist(int(user["id"]), playlist_title)
-            new_pl_id = new_pl["id"]
-            await message.answer(f"📁 Создан плейлист **{playlist_title}**. Начинаю загрузку...")
+        tracks_to_import = []
+        already_in_db = 0
         
-        await import_playlist(int(user["id"]), url, source_type, is_paid)
-        
-        added_to_queue = 0
-        limit_reached = False
-        tracks_to_download = []
-        
-        for idx, track in enumerate(tracks):
-            if added_to_queue >= remaining_limit:
-                limit_reached = True
-                break 
-                
+        for track in tracks:
+            if len(tracks_to_import) >= remaining_limit: break
             artist, title = track.get('artist', 'Unknown'), track.get('title', 'Unknown')
             
             existing_track_id = await check_track_exists(artist, title)
             
-            if existing_track_id:
-                success = await add_track_to_playlist(new_pl_id, existing_track_id, position=idx)
-                if success:
-                    await message.answer(f"⏩ Добавлен из базы в плейлист: {artist} - {title}")
-                else:
-                    await message.answer(f"⏩ Уже в этом плейлисте: {artist} - {title}")
-                continue 
-            
-            tracks_to_download.append(track)
-            added_to_queue += 1
-            
-        if added_to_queue > 0:
-            await increment_download_count(int(user["id"]), added_to_queue)
-            await message.answer(f"🎉 Добавлено в очередь: {added_to_queue} треков.")
-            
-            for idx, track in enumerate(tracks_to_download):
-                is_last = (idx == len(tracks_to_download) - 1)
-                artist, title = track.get('artist', 'Unknown'), track.get('title', 'Unknown')
+            if existing_track_id and existing_track_id > 0:
+                already_in_db += 1
+            else:
+                if existing_track_id == -1:
+                    track['skip_soundcloud'] = True
+                tracks_to_import.append(track)
                 
-                real_position = tracks.index(track)
-                
-                await download_queue.put({
-                    'user_id': int(user["id"]), 'tg_id': message.from_user.id,
-                    'artist': artist, 'title': title,
-                    'original_duration': track.get('duration', 0), 'import_source': source_type,
-                    'is_last': is_last, 'limit_reached': limit_reached,
-                    'pending_playlist_id': new_pl_id,
-                    'pending_position': real_position
-                })
-                await message.answer(f"⏳ В очереди: {artist} - {title}...")
-                
-        else:
-            await message.answer("🤷‍♂️ Не найдено новых треков для скачивания.")
-            if limit_reached:
-                await message.answer("⚠️ **Достигнут дневной лимит!**\nОстальные треки из плейлиста не были добавлены.\n\nПовысьте свой уровень или купите **Премиум**, чтобы снять все ограничения.")
+        if not tracks_to_import:
+            return await message.answer("🤷‍♂️ Не найдено новых треков (все уже есть в базе).")
+
+        if already_in_db > 0:
+            await message.answer(f"ℹ️ Пропущено {already_in_db} треков (уже есть в базе).")
+            
+        # Лимит списывается в download_worker только за успешно скачанные треки
+        
+        await show_import_destination_menu(
+            message, int(user["id"]), tracks=tracks_to_import, is_single=False, source_type=source_type, playlist_title=playlist_title
+        )
             
     except ValueError as exc: await message.answer(f"Некорректная ссылка: {exc}")
     except Exception as exc:
         log(f"Ошибка /import: {exc}")
         await message.answer("Не удалось импортировать плейлист.")
+
+
+# ============================================================
+# ИМПОРТ АРТИСТА С HITMO (умная пагинация + пред-фильтр дубликатов)
+# ============================================================
+@dp.message(Command("import_artist_hitmo"))
+async def cmd_import_artist_hitmo(message: Message, command: CommandObject) -> None:
+    user = await _ensure_user(message)
+    urls_input = (command.args or "").strip()
+    
+    if not urls_input:
+        return await message.answer(
+            "Укажи ссылку на страницу артиста с Hitmo. "
+            "Тебе достаточно скинуть одну ссылку, бот сам пролистает все страницы:\n"
+            "`/import_artist_hitmo https://ru.hitmox.net/artist/noggano`"
+        )
+        
+    urls = urls_input.split()
+    status_msg = await message.answer(
+        "🔎 Парсю страницы Hitmo. Это может занять несколько минут (бот сам листает страницы 1, 2, 3...)..."
+    )
+    
+    all_tracks = []
+    for url in urls:
+        tracks = await parse_artist_page_hitmo(url)
+        all_tracks.extend(tracks)
+        
+    # --- Убираем дубликаты по URL + проверяем что уже есть в базе ---
+    seen_urls = set()
+    unique_tracks = []
+    already_in_db = 0
+    
+    for t in all_tracks:
+        if t['url'] in seen_urls:
+            continue
+        seen_urls.add(t['url'])
+        
+        # --- ПРОВЕРКА ДУБЛИКАТОВ В БАЗЕ ---
+        artist = t.get('artist', 'Unknown')
+        title = t.get('title', 'Unknown')
+        existing_id = await check_track_exists(artist, title)
+        
+        if existing_id and existing_id > 0:
+            already_in_db += 1
+            continue  # Уже есть в базе — пропускаем
+        # -----------------------------------
+        
+        t['skip_soundcloud'] = True
+        unique_tracks.append(t)
+    # ------------------------------------------------------------------
+            
+    if not unique_tracks:
+        if already_in_db > 0:
+            return await status_msg.edit_text(f"ℹ️ Все найденные треки ({already_in_db}) уже есть в базе.")
+        return await status_msg.edit_text("❌ Не удалось найти треки на этой странице. Проверь ссылку.")
+        
+    limit_info = await check_download_limit(int(user["id"]), _is_premium(user))
+    if not limit_info["allowed"]: return await status_msg.edit_text(f"⛔ {limit_info['msg']}")
+    
+    remaining = limit_info["remaining"]
+    tracks_to_import = unique_tracks[:remaining]
+    
+    if already_in_db > 0:
+        await message.answer(f"ℹ️ Пропущено {already_in_db} треков (уже есть в базе).")
+    
+    if len(unique_tracks) > remaining:
+        await status_msg.edit_text(f"⚠️ Найдено {len(unique_tracks)} новых треков, но твой лимит позволяет скачать только {remaining}.")
+    else:
+        await status_msg.edit_text(f"✅ Найдено {len(unique_tracks)} новых треков. Начинаю импорт...")
+        
+    # Лимит списывается в download_worker только за успешно скачанные треки
+    
+    await show_import_destination_menu(
+        message, int(user["id"]), tracks=tracks_to_import, is_single=False, source_type="hitmo_artist"
+    )
+# ============================================================
+
+
+# ============================================================
+# ОБРАБОТЧИКИ КНОПОК ВЫБОРА ПЛЕЙЛИСТА
+# ============================================================
+@dp.callback_query(F.data.startswith("import_dest_"))
+async def process_import_destination(callback: CallbackQuery):
+    user = await get_user(callback.from_user.id)
+    data = pending_imports.get(int(user["id"]))
+    
+    if not data:
+        return await callback.answer("Время ожидания истекло. Отправь команду заново.", show_alert=True)
+        
+    action = callback.data.replace("import_dest_", "")
+    
+    if action == "suggested":
+        playlist_title = data.get("playlist_title")
+        if not playlist_title:
+            return await callback.answer("Ошибка: название не найдено.", show_alert=True)
+            
+        existing = await get_user_playlist_by_title(int(user["id"]), playlist_title)
+        if existing:
+            dest_playlist_id = existing["id"]
+        else:
+            new_pl = await create_user_playlist(int(user["id"]), playlist_title)
+            dest_playlist_id = new_pl["id"]
+            
+        await callback.message.edit_text(f"⏳ Начинаю загрузку в **{playlist_title}**...")
+        await execute_import(callback.message, int(user["id"]), callback.from_user.id, dest_playlist_id, add_to_liked=False)
+        return
+    
+    if action == "new":
+        waiting_for_new_playlist[int(user["id"])] = True
+        await callback.message.edit_text("✍️ Введи название для нового плейлиста (просто отправь текст сообщением):")
+        return
+    
+    if action == "db_only":
+        dest_playlist_id = None
+        add_to_liked = False
+        dest_name = "Общую базу"
+        await callback.message.edit_text(f"⏳ Начинаю загрузку в **{dest_name}**...")
+        await execute_import(callback.message, int(user["id"]), callback.from_user.id, dest_playlist_id, add_to_liked)
+        return
+        
+    if action == "liked":
+        dest_playlist_id = None
+        add_to_liked = True
+        dest_name = "Мне нравится"
+        await callback.message.edit_text(f"⏳ Начинаю загрузку в **{dest_name}**...")
+        await execute_import(callback.message, int(user["id"]), callback.from_user.id, dest_playlist_id, add_to_liked)
+        return
+    else:
+        dest_playlist_id = int(action.replace("pl_", ""))
+        add_to_liked = False
+        dest_name = "Плейлист"
+
+    await callback.message.edit_text(f"⏳ Начинаю загрузку в **{dest_name}**...")
+    await execute_import(callback.message, int(user["id"]), callback.from_user.id, dest_playlist_id, add_to_liked)
+
+@dp.callback_query(F.data == "import_dest_cancel")
+async def cancel_import(callback: CallbackQuery):
+    user = await get_user(callback.from_user.id)
+    if int(user["id"]) in pending_imports:
+        del pending_imports[int(user["id"])]
+    await callback.message.edit_text("❌ Импорт отменен.")
+
+async def execute_import(message: Message, user_id: int, tg_id: int, playlist_id: int | None, add_to_liked: bool):
+    data = pending_imports.get(user_id)
+    if not data: return
+    
+    tracks = data["tracks"]
+    is_single = data["is_single"]
+    source_type = data["source_type"]
+    direct_url = data.get("direct_url")
+    
+    for idx, track in enumerate(tracks):
+        is_last = (idx == len(tracks) - 1)
+        
+        task = {
+            'user_id': user_id, 'tg_id': tg_id,
+            'artist': track.get('artist', 'Unknown'), 'title': track.get('title', 'Unknown'),
+            'original_duration': track.get('duration', 0), 'import_source': source_type,
+            'is_last': is_last, 'limit_reached': False,
+            'pending_playlist_id': playlist_id,
+            'pending_position': idx,
+            'is_single': is_single,
+            'add_to_liked': add_to_liked,
+            'skip_soundcloud': track.get('skip_soundcloud', False)
+        }
+        
+        if is_single and source_type == "soundcloud" and direct_url:
+            task['direct_url'] = direct_url
+            
+        await download_queue.put(task)
+        
+    del pending_imports[user_id]
+# ============================================================
 
 @dp.message(Command("search"))
 async def cmd_search(message: Message, command: CommandObject) -> None:
@@ -512,7 +783,6 @@ async def cmd_deletetrack(message: Message, command: CommandObject) -> None:
     if await delete_track(int(args)): await message.answer(f"🗑️ Трек {args} удален.")
     else: await message.answer(f"❌ Трек {args} не найден.")
 
-# --- КЕШИРОВАНИЕ ВСЕХ ТРЕКОВ (file_id + обложки) ---
 @dp.message(Command("cache_all"))
 async def cmd_cache_all(message: Message):
     if message.from_user.id != ADMIN_ID: return
@@ -532,12 +802,10 @@ async def cmd_cache_all(message: Message):
             fail_count += 1
             continue
             
-        # 1. Пытаемся починить обложку (если её нет)
         await asyncio.to_thread(ensure_track_has_cover, str(file_path), track["artist"], track["title"])
             
         msg = None
         try:
-            # 2. Отправляем трек в чат (уже с обложкой) для генерации file_id
             msg = await bot.send_audio(
                 chat_id=message.chat.id,
                 audio=FSInputFile(file_path),
@@ -561,7 +829,6 @@ async def cmd_cache_all(message: Message):
                 try: await msg.delete()
                 except: pass
                 
-        # Пауза, чтобы не получить бан (чуть больше, так как еще ищем обложки)
         await asyncio.sleep(2.0)
         
         if (i + 1) % 10 == 0:
@@ -817,12 +1084,10 @@ async def process_moderation(callback: CallbackQuery):
 
     await _send_next_moderation_track(callback.message, int(admin_user["id"]))
 
-# --- НОВАЯ ЛОГИКА ДЛЯ ТРЕЙЛЕРОВ ---
+# --- ЛОГИКА ДЛЯ ТРЕЙЛЕРОВ ---
 async def process_trailer(message: Message, file_obj: Any):
-    """Логика сохранения трейлера"""
     try:
         text = message.reply_to_message.text
-        # Извлекаем ID плейлиста с помощью регулярки для надежности
         match = re.search(r"ID: (\d+)", text)
         if not match: 
             await message.answer("❌ Не удалось распознать ID плейлиста. Попробуй заново.")
@@ -949,13 +1214,12 @@ async def handle_audio(message: Message) -> None:
         log(f"Ошибка обработки аудио: {exc}")
         await message.answer("Не удалось отправить трек.")
 
-# --- НОВЫЙ ОБРАБОТЧИК ДОКУМЕНТОВ ---
+# --- ОБРАБОТЧИК ДОКУМЕНТОВ ---
 @dp.message(F.document)
 async def handle_document(message: Message) -> None:
     if message.reply_to_message and message.reply_to_message.text:
         text = message.reply_to_message.text
         
-        # Если это ответ на запрос обложки
         if "ID:" in text and "обложки" in text:
             try:
                 match = re.search(r"ID: (\d+)", text)
@@ -978,7 +1242,6 @@ async def handle_document(message: Message) -> None:
                 await message.answer("❌ Ошибка при сохранении обложки.")
             return
             
-        # Если это ответ на запрос трейлера
         if "ID:" in text:
             await process_trailer(message, message.document)
             return
@@ -997,7 +1260,6 @@ async def handle_photo(message: Message) -> None:
                 
             playlist_id = int(match.group(1))
             
-            # Берем картинку в максимальном разрешении
             photo = message.photo[-1]
             
             if photo.file_size > 5 * 1024 * 1024:
@@ -1018,9 +1280,21 @@ async def handle_photo(message: Message) -> None:
             log(f"Ошибка сохранения обложки: {e}")
             await message.answer("❌ Ошибка при сохранении обложки. Попробуй еще раз.")
 
-# --- ОБРАБОТЧИК ТЕКСТА (ССЫЛКИ НА SOUNDCLOUD) ---
+# --- ОБРАБОТЧИК ТЕКСТА ---
 @dp.message(F.text)
 async def handle_text(message: Message) -> None:
+    user = await _ensure_user(message)
+
+    if int(user["id"]) in waiting_for_new_playlist:
+        del waiting_for_new_playlist[int(user["id"])]
+        title = message.text.strip()
+        
+        new_pl = await create_user_playlist(int(user["id"]), title)
+        await message.answer(f"📁 Плейлист **{title}** создан! Начинаю загрузку...")
+        
+        await execute_import(message, int(user["id"]), message.from_user.id, new_pl["id"], add_to_liked=False)
+        return
+
     if message.from_user.id in waiting_for_replacement:
         url = message.text.strip()
         if "soundcloud.com" in url:
@@ -1058,7 +1332,6 @@ async def handle_text(message: Message) -> None:
                 waiting_for_replacement[message.from_user.id] = track_id
             return
 
-    await _ensure_user(message)
     await message.answer("Я пока учусь! Используй /help")
 
 # --- INLINE-РЕЖИМ ---
@@ -1072,8 +1345,6 @@ async def inline_query_handler(inline_query: InlineQuery) -> None:
     results = []
     
     for t in tracks:
-        # Если у трека нет file_id, мы не можем отправить его в инлайн-режиме 
-        # (из-за HMAC-защиты стрима). Поэтому пропускаем такие треки.
         if not t.get("file_id"):
             continue
             
@@ -1082,16 +1353,14 @@ async def inline_query_handler(inline_query: InlineQuery) -> None:
         results.append(
             InlineQueryResultCachedAudio(
                 id=str(t["id"]),
-                audio_file_id=t["file_id"], # <--- Используем file_id напрямую
+                audio_file_id=t["file_id"],
                 caption=f"🎵 {t['artist']} — {t['title']}\n⭐ Качество: {quality}"
             )
         )
         
-        if len(results) >= 10: # Ограничиваем выдачу 10 треками для удобства
+        if len(results) >= 10:
             break
             
-    # Если результатов нет (например, треки еще не скачаны ни разу), 
-    # можно вернуть пустой список с сообщением (опционально)
     await inline_query.answer(results, cache_time=5, is_personal=True)
 
 async def main() -> None:
@@ -1100,7 +1369,14 @@ async def main() -> None:
     await init_db()
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="🎵 Открыть плеер", web_app=WebAppInfo(url=WEBAPP_STUB_URL)))
-    await bot.set_my_commands(commands=[BotCommand(command="start", description="Главное меню"), BotCommand(command="profile", description="Мой профиль"), BotCommand(command="import", description="Импорт плейлиста"), BotCommand(command="search", description="Поиск в базе")], scope=BotCommandScopeDefault())
+    await bot.set_my_commands(commands=[
+        BotCommand(command="start", description="Главное меню"), 
+        BotCommand(command="profile", description="Мой профиль"), 
+        BotCommand(command="import", description="Импорт плейлиста"), 
+        BotCommand(command="import_text", description="Импорт текстом (ВК, Spotify)"),
+        BotCommand(command="import_artist_hitmo", description="Импорт всех треков артиста с Hitmo"),
+        BotCommand(command="search", description="Поиск в базе")
+    ], scope=BotCommandScopeDefault())
     await bot.set_my_commands(commands=[BotCommand(command="admin", description="👑 Админ-панель"), BotCommand(command="moderate", description="⚙️ Модерация"), BotCommand(command="cache_all", description="🖼 Кеширование треков + обложки")], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     asyncio.create_task(download_worker())
     log("Запуск бота...")

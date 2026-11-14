@@ -25,7 +25,8 @@ from backend.database import (
     report_track, remove_track_from_playlist, get_playlist_by_id,
     set_playlist_custom_cover, get_similar_artists, get_trending_tracks,
     get_trending_artists, get_tracks_by_artist, set_track_file_id,
-    update_user_settings, buy_theme
+    update_user_settings, buy_theme,
+    get_wave_recommendations  # <--- ДОБАВЛЕНО
 )
 
 logger = logging.getLogger(__name__)
@@ -132,6 +133,13 @@ async def get_profile(request: Request):
     if not user: return {"error": "Пользователь не найден"}
     
     level_info = get_level_progress(user["xp"])
+    
+    import json
+    unlocked = []
+    try:
+        unlocked = json.loads(user.get("unlocked_themes", '["dark"]'))
+    except:
+        unlocked = ["dark"]
         
     return {
         "id": user["telegram_id"],
@@ -139,7 +147,10 @@ async def get_profile(request: Request):
         "xp": user["xp"],
         "level": user["level"],
         "is_premium": bool(user["is_premium"]),
-        "level_progress": level_info
+        "level_progress": level_info,
+        "active_theme": user.get("active_theme", "dark"),
+        "unlocked_themes": unlocked,
+        "loop_playlist": bool(user.get("loop_playlist", 0))
     }
 
 @app.post("/api/claim_daily")
@@ -208,6 +219,37 @@ async def api_get_trending_artists(request: Request):
     artists = await get_trending_artists(limit=10)
     return {"artists": artists}
 
+# ============================================================
+# НОВЫЙ ЭНДПОИНТ: "МОЯ ВОЛНА" (умные рекомендации)
+# ============================================================
+@app.get("/api/wave")
+async def api_get_wave(request: Request):
+    tg_id = await get_tg_user_id(request)
+    if not tg_id: return {"error": "Нет данных от Telegram"}
+    
+    user = await get_user(tg_id)
+    if not user: return {"error": "Пользователь не найден"}
+    
+    # Генерируем 30 треков для бесконечной волны
+    tracks = await get_wave_recommendations(int(user["id"]), limit=30)
+    
+    # Получаем лайки пользователя, чтобы на фронтенде сразу рисовать красные сердечки
+    liked_ids = await get_user_liked_track_ids(int(user["id"]))
+    
+    result = []
+    for t in tracks:
+        quality = t["quality_status"] if t["quality_status"] != 'none' else 'Verified'
+        result.append({
+            "id": t["id"], 
+            "artist": t["artist"], 
+            "title": t["title"], 
+            "quality": quality,
+            "is_liked": t["id"] in liked_ids
+        })
+        
+    return {"tracks": result}
+# ============================================================
+
 @app.get("/api/artist_tracks")
 async def api_get_artist_tracks(request: Request):
     artist = request.query_params.get("artist", "").strip()
@@ -273,6 +315,18 @@ async def api_download(track_id: int, request: Request):
 async def api_cover(track_id: int):
     fallback_url = "https://cdn-icons-png.flaticon.com/512/3844/3844724.png"
     
+    # 1. Проверяем, есть ли уже готовая обложка в кэше
+    cache_dir = Path("uploads/covers")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cached_jpg = cache_dir / f"track_{track_id}.jpg"
+    cached_png = cache_dir / f"track_{track_id}.png"
+    
+    if cached_jpg.exists():
+        return FileResponse(cached_jpg, media_type="image/jpeg")
+    if cached_png.exists():
+        return FileResponse(cached_png, media_type="image/png")
+    
+    # 2. Если нет, достаем из MP3
     track = await get_track_by_id(track_id)
     if not track: return RedirectResponse(url=fallback_url)
     
@@ -300,6 +354,12 @@ async def api_cover(track_id: int):
             mime_type = audio.pictures[0].mime
             
         if cover_data:
+            # 3. СОХРАНЯЕМ В КЭШ, чтобы в следующий раз отдать мгновенно
+            if "png" in mime_type.lower():
+                cached_png.write_bytes(cover_data)
+            else:
+                cached_jpg.write_bytes(cover_data)
+                
             return Response(content=cover_data, media_type=mime_type)
             
     except Exception as e:

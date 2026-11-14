@@ -19,6 +19,74 @@
             --nav-height: 70px;
         }
 
+        /* --- СВЕТЛАЯ ТЕМА (Мягкая) --- */
+        body[data-theme="light"] {
+            --bg-color: #f2f2f7;
+            --card-bg: #ffffff;
+            --card-hover: #e5e5ea;
+            --text-main: #1c1c1e; 
+            --text-muted: #8e8e93;
+            --blue: #007aff;
+        }
+        /* Фиксы для светлой темы */
+        body[data-theme="light"] .level-card { background: linear-gradient(180deg, #ffffff 0%, #f2f2f7 100%); border-color: #e5e5ea; }
+        body[data-theme="light"] .premium-banner { background: linear-gradient(135deg, #fffdf5 0%, #fff9e6 100%); border-color: rgba(255, 215, 0, 0.5); }
+        body[data-theme="light"] .premium-text h4 { color: #b8860b; }
+        body[data-theme="light"] .bottom-nav { background: rgba(255, 255, 255, 0.95); border-top: 1px solid #e5e5ea; }
+        body[data-theme="light"] .player-bar { background: rgba(255, 255, 255, 0.8); border-color: #e5e5ea; }
+        body[data-theme="light"] .modal-content { background: #ffffff; }
+        body[data-theme="light"] .action-btn-modal { background: #f2f2f7; color: #1c1c1e; }
+        body[data-theme="light"] .search-input-wrapper { background: #e5e5ea; }
+        body[data-theme="light"] .playlist-row-item, body[data-theme="light"] .track-item { background: rgba(255, 255, 255, 0.8); border-color: #e5e5ea; }
+        body[data-theme="light"] .track-title { color: #1c1c1e; }
+        body[data-theme="light"] .full-player { background-color: #121212; } /* Плеер всегда темный */
+
+        /* Фиксы текста для светлой темы */
+        body[data-theme="light"] .search-input-wrapper input,
+        body[data-theme="light"] #playlist-title,
+        body[data-theme="light"] .btn-search[style*="var(--card-bg)"] {
+            color: var(--text-main) !important;
+        }
+        
+        body[data-theme="light"] .search-input-wrapper input::placeholder,
+        body[data-theme="light"] #playlist-title::placeholder {
+            color: var(--text-muted) !important;
+        }
+        
+        /* Чтобы кнопка "Назад" не теряла фон при наведении */
+        body[data-theme="light"] .btn-search[style*="var(--card-bg)"]:active {
+            background: var(--card-hover) !important;
+        }
+
+        /* Фикс иконок в светлой теме (мини-плеер) */
+        body[data-theme="light"] .btn-svg { color: var(--text-main) !important; }
+        body[data-theme="light"] .player-close-btn { color: var(--text-main) !important; }
+        body[data-theme="light"] .player-close-btn svg { fill: currentColor !important; }
+        body[data-theme="light"] .btn-svg svg { fill: currentColor !important; }
+        
+        /* Фикс фона полоски перемотки в светлой теме */
+        body[data-theme="light"] .player-progress-bar { background: rgba(0,0,0,0.15) !important; }
+
+        /* Фикс кнопки "Добавить трейлер" на светлой теме */
+        body[data-theme="light"] .trailer-btn {
+            background: rgba(0, 0, 0, 0.05) !important;
+            border-color: rgba(0, 0, 0, 0.1) !important;
+            color: var(--text-main) !important;
+        }
+        body[data-theme="light"] .trailer-btn:active {
+            background: rgba(0, 0, 0, 0.1) !important;
+        }
+
+        /* --- НЕОНОВАЯ СИНЯЯ ТЕМА (как в VS Code) --- */
+        body[data-theme="blue"] {
+            --bg-color: #0a0f1c;
+            --card-bg: #121a2f;
+            --card-hover: #1c2745;
+            --text-main: #e0e6ed;
+            --text-muted: #6b7c99;
+            --blue: #00d2ff; /* Более неоновый синий */
+        }
+
         * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 
         body {
@@ -34,6 +102,17 @@
 
         h1, h2, h3 { margin: 0; font-weight: 700; }
         .header-title { font-size: 28px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
+
+        /* --- КНОПКА ВОЛНЫ --- */
+        .btn-wave {
+            width: 100%; padding: 16px; border-radius: 16px; border: none;
+            background: linear-gradient(135deg, #00d2ff 0%, #3a7bd5 100%);
+            color: white; font-size: 16px; font-weight: 700;
+            display: flex; justify-content: center; align-items: center; gap: 8px;
+            cursor: pointer; margin-bottom: 20px; box-shadow: 0 8px 20px rgba(0, 122, 255, 0.3);
+            transition: transform 0.2s;
+        }
+        .btn-wave:active { transform: scale(0.96); }
 
         /* --- ПОИСК --- */
         .search-container { display: flex; gap: 10px; margin-bottom: 20px; }
@@ -174,6 +253,42 @@
         .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; font-size: 16px; font-weight: 600; }
         .btn-create-pl { background: var(--card-bg); border-radius: 16px; padding: 15px; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--text-muted); font-weight: 600; border: 1px dashed #3a3a3c; width: 100%; }
 
+        /* --- НАСТРОЙКИ --- */
+        .settings-group { background: var(--card-bg); border-radius: 16px; margin-bottom: 20px; overflow: hidden; }
+        .settings-item { display: flex; justify-content: space-between; align-items: center; padding: 15px; border-bottom: 1px solid rgba(128,128,128,0.1); }
+        .settings-item:last-child { border-bottom: none; }
+        .settings-label { font-size: 15px; font-weight: 500; display: flex; align-items: center; gap: 10px; }
+
+        .settings-hint {
+            font-size: 12px;
+            color: var(--text-muted);
+            background: rgba(128,128,128,0.1);
+            padding: 8px 10px;
+            border-radius: 8px;
+            margin-top: 8px;
+            line-height: 1.4;
+        }
+        
+        /* iOS Тумблер */
+        .switch { position: relative; display: inline-block; width: 50px; height: 30px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #3a3a3c; transition: .4s; border-radius: 30px; }
+        .slider:before { position: absolute; content: ""; height: 26px; width: 26px; left: 2px; bottom: 2px; background-color: white; transition: .4s; border-radius: 50%; box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
+        input:checked + .slider { background-color: var(--green); }
+        input:checked + .slider:before { transform: translateX(20px); }
+
+        /* Карточки тем */
+        .theme-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 10px; }
+        .theme-card { background: var(--card-hover); border-radius: 12px; padding: 10px; text-align: center; cursor: pointer; border: 2px solid transparent; transition: transform 0.2s; }
+        .theme-card:active { transform: scale(0.95); }
+        .theme-card.active { border-color: var(--blue); }
+        .theme-preview { width: 100%; height: 60px; border-radius: 8px; margin-bottom: 8px; }
+        .theme-preview.dark { background: #121212; }
+        .theme-preview.light { background: #f2f2f7; }
+        .theme-preview.blue { background: linear-gradient(135deg, #0a0f1c, #00d2ff); }
+        .theme-name { font-size: 12px; font-weight: 600; }
+        .theme-price { font-size: 10px; color: var(--gold); margin-top: 2px; }
+
         /* --- СТАТИСТИКА --- */
         .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }
         .stat-card { background: var(--card-hover); padding: 15px; border-radius: 16px; text-align: center; border: 1px solid rgba(255,255,255,0.05); }
@@ -281,8 +396,15 @@
         
         .fp-info-row { display: flex; justify-content: space-between; align-items: center; margin: 15px 0 10px 0; position: relative; z-index: 1; flex-shrink: 0; width: 100%; padding: 0 10px;}
         .fp-info { text-align: left; flex-grow: 1; overflow: hidden; }
-        .fp-title { font-size: 24px; font-weight: 700; margin-bottom: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .fp-artist { font-size: 16px; color: rgba(255,255,255,0.7); }
+        .fp-title { 
+            font-size: 24px; font-weight: 700; margin-bottom: 5px; 
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            color: #ffffff !important; /* ВСЕГДА БЕЛЫЙ */
+        }
+        .fp-artist { 
+            font-size: 16px; 
+            color: rgba(255, 255, 255, 0.7) !important; /* ВСЕГДА БЕЛЫЙ */
+        }
         .fp-like-btn { background: transparent; border: none; color: rgba(255,255,255,0.6); cursor: pointer; padding: 10px; }
         .fp-like-btn svg { width: 32px; height: 32px; fill: currentColor; transition: transform 0.2s; }
         .fp-like-btn.liked { color: var(--red); }
@@ -303,7 +425,66 @@
 
         .fp-btn.active { color: var(--blue) !important; }
 
+        /* Обертка для правой части в ландшафте */
+        .fp-right-panel {
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+        }
+
+        /* --- LANDSCAPE MODE (Горизонтальный экран) --- */
+        @media (orientation: landscape) {
+            .full-player {
+                max-width: 100% !important; /* Убираем ограничение с ПК */
+                width: 100% !important;
+                height: 100% !important;
+                top: 0 !important;
+                border-radius: 0 !important;
+                background-color: #121212 !important; /* Плотный фон */
+                
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                grid-template-rows: auto 1fr;
+                grid-template-areas: 
+                    "header header"
+                    "cover right-panel";
+                gap: 15px;
+                padding: 15px 30px;
+                align-items: center;
+                justify-content: center;
+            }
+            
+            .fp-header {
+                grid-area: header;
+                margin-bottom: 0;
+            }
+            
+            .fp-cover-container {
+                grid-area: cover;
+                width: 100%;
+                max-height: 70vh;
+                aspect-ratio: 1/1;
+                margin: 0 auto;
+            }
+            
+            .fp-right-panel {
+                grid-area: right-panel;
+                justify-content: center;
+                height: 100%;
+            }
+            
+            .fp-info-row { margin: 5px 0; }
+            .fp-title { font-size: 20px; }
+            .fp-artist { font-size: 14px; }
+            .fp-progress-container { margin-bottom: 5px; }
+            .fp-controls { padding-bottom: 0; }
+        }
+
         audio { display: none; }
+
+        /* Скрываем нижнее меню и мини-плеер, когда открыт большой плеер */
+        body.full-player-open .player-bar { opacity: 0; pointer-events: none; transform: translateY(100px); }
+        body.full-player-open .bottom-nav { display: none; }
 
         /* --- МОДАЛЬНЫЕ ОКНА --- */
         .modal-overlay { 
@@ -561,7 +742,11 @@
     <div id="toast-container"></div>
 
     <div id="tab-profile" class="tab-content">
-        <div class="header-title">Профиль</div>
+        <div class="header-title">Профиль 
+            <span onclick="openSettings()" style="cursor:pointer; display: flex; align-items: center;">
+                <svg viewBox="0 0 24 24" style="width: 24px; height: 24px; fill: var(--text-muted);"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+            </span>
+        </div>
         
         <div class="profile-header">
             <div class="avatar-container" onclick="openStats()">
@@ -642,6 +827,10 @@
             </div>
             <button class="btn-search" onclick="searchMusic()">Найти</button>
         </div>
+        
+        <button class="btn-wave" onclick="startWave()">
+            🌊 Моя Волна
+        </button>
         
         <div id="trending-container">
             <h3 style="font-size: 16px; margin-bottom: 15px; color: var(--text-muted);">🔥 Сейчас в тренде</h3>
@@ -736,48 +925,50 @@
             <img src="" id="fp-cover" class="fp-cover" alt="Cover">
         </div>
         
-        <div class="fp-info-row">
-            <div class="fp-info">
-                <div class="fp-title" id="fp-title">Выберите трек</div>
-                <div class="fp-artist" id="fp-artist">Исполнитель</div>
+        <div class="fp-right-panel">
+            <div class="fp-info-row">
+                <div class="fp-info">
+                    <div class="fp-title" id="fp-title">Выберите трек</div>
+                    <div class="fp-artist" id="fp-artist">Исполнитель</div>
+                </div>
+                <button class="fp-like-btn" id="fp-like-btn" onclick="toggleLikeCurrent()">
+                    <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+                </button>
             </div>
-            <button class="fp-like-btn" id="fp-like-btn" onclick="toggleLikeCurrent()">
-                <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
-            </button>
-        </div>
-        
-        <div class="fp-progress-container">
-            <div class="fp-time" id="fp-current-time">0:00</div>
-            <div class="fp-progress-bar" id="fp-progress-bar-container" onpointerdown="startSeek(event, 'full')">
-                <div class="fp-progress-fill" id="fp-progress-fill"></div>
-                <div class="fp-progress-thumb" id="fp-progress-thumb"></div>
+            
+            <div class="fp-progress-container">
+                <div class="fp-time" id="fp-current-time">0:00</div>
+                <div class="fp-progress-bar" id="fp-progress-bar-container" onpointerdown="startSeek(event, 'full')">
+                    <div class="fp-progress-fill" id="fp-progress-fill"></div>
+                    <div class="fp-progress-thumb" id="fp-progress-thumb"></div>
+                </div>
+                <div class="fp-time" id="fp-total-time">0:00</div>
             </div>
-            <div class="fp-time" id="fp-total-time">0:00</div>
-        </div>
-        
-        <div class="fp-controls">
-            <button class="fp-btn" id="fp-shuffle-btn" onclick="toggleShuffle()" style="color: rgba(255,255,255,0.4);">
-                <svg viewBox="0 0 24 24" style="width: 30px; height: 30px; fill: currentColor;"><path d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z"/></svg>
-            </button>
             
-            <button class="fp-btn" onclick="playPrevTrack()">
-                <svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>
-            </button>
-            
-            <button class="fp-btn-play" id="fp-btn-play-pause" onclick="togglePlay()">
-                <svg id="fp-svg-play" viewBox="0 0 24 24" style="display:none;"><path d="M8 5v14l11-7z"/></svg>
-                <svg id="fp-svg-pause" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
-            </button>
-            
-            <button class="fp-btn" onclick="playNextTrack()">
-                <svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
-            </button>
+            <div class="fp-controls">
+                <button class="fp-btn" id="fp-shuffle-btn" onclick="toggleShuffle()" style="color: rgba(255,255,255,0.4);">
+                    <svg viewBox="0 0 24 24" style="width: 30px; height: 30px; fill: currentColor;"><path d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z"/></svg>
+                </button>
+                
+                <button class="fp-btn" onclick="playPrevTrack()">
+                    <svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>
+                </button>
+                
+                <button class="fp-btn-play" id="fp-btn-play-pause" onclick="togglePlay()">
+                    <svg id="fp-svg-play" viewBox="0 0 24 24" style="display:none;"><path d="M8 5v14l11-7z"/></svg>
+                    <svg id="fp-svg-pause" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+                </button>
+                
+                <button class="fp-btn" onclick="playNextTrack()">
+                    <svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+                </button>
 
-            <button class="fp-btn" id="fp-repeat-btn" onclick="toggleRepeat()" style="color: rgba(255,255,255,0.4);">
-                <svg id="fp-svg-repeat" viewBox="0 0 24 24" style="width: 30px; height: 30px; fill: currentColor;">
-                    <path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/>
-                </svg>
-            </button>
+                <button class="fp-btn" id="fp-repeat-btn" onclick="toggleRepeat()" style="color: rgba(255,255,255,0.4);">
+                    <svg id="fp-svg-repeat" viewBox="0 0 24 24" style="width: 30px; height: 30px; fill: currentColor;">
+                        <path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/>
+                    </svg>
+                </button>
+            </div>
         </div>
         
         <audio id="audio-element" onended="playNextTrack()" ontimeupdate="updateProgress()" onloadedmetadata="setDuration()"></audio>
@@ -888,6 +1079,40 @@
         </div>
     </div>
 
+    <!-- Модалка настроек -->
+    <div id="settings-modal" class="modal-overlay" onclick="closeSettings(event)">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <button class="modal-close-btn" onclick="closeSettings()">
+                <svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"></path></svg>
+            </button>
+            <div style="width: 40px; height: 4px; background: #3a3a3c; border-radius: 2px; margin: 0 auto 15px auto;"></div>
+            <h3 style="margin-top:0; text-align: center; margin-bottom: 20px;">Настройки</h3>
+            
+            <div class="settings-group">
+                <div style="padding: 15px; border-bottom: 1px solid rgba(128,128,128,0.1);">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <div class="settings-label" style="display: flex; align-items: center; gap: 8px;">
+                            <svg viewBox="0 0 24 24" style="width: 20px; height: 20px; fill: var(--blue);"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>
+                            Зацикливать плейлист
+                        </div>
+                        <label class="switch">
+                            <input type="checkbox" id="loop-switch" onchange="toggleLoopSetting(this)">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                    <div class="settings-hint">Когда плейлист заканчивается, воспроизведение начинается с первого трека заново.</div>
+                </div>
+            </div>
+
+            <div class="settings-group" style="padding: 15px;">
+                <div style="font-size: 14px; font-weight: 600; margin-bottom: 10px;">Тема оформления</div>
+                <div class="theme-grid" id="theme-grid">
+                    <!-- Сюда JS вставит карточки тем -->
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
         const tg = window.Telegram.WebApp;
         tg.expand();
@@ -908,6 +1133,10 @@
         let repeatMode = 'none';
         window.trendingArtists = [];
         window.currentArtistTracks = [];
+
+        let userThemes = ['dark'];
+        let activeTheme = 'dark';
+        let loopPlaylist = false;
 
         async function apiFetch(url, options = {}) {
             const headers = { ...options.headers, 'Authorization': `TWA ${tg.initData}` };
@@ -1048,6 +1277,16 @@
                     document.getElementById('level-text').innerText = `Максимальный уровень! (${data.xp} XP)`;
                 }
             }
+
+            // Загрузка настроек пользователя
+            activeTheme = data.active_theme || 'dark';
+            userThemes = data.unlocked_themes || ['dark'];
+            loopPlaylist = data.loop_playlist || false;
+            
+            const loopSwitch = document.getElementById('loop-switch');
+            if (loopSwitch) loopSwitch.checked = loopPlaylist;
+            
+            applyTheme(activeTheme);
             
             if (data.is_premium) {
                 document.getElementById('premium-status').innerHTML = '<div style="background:var(--card-bg);color:var(--gold);padding:8px;border-radius:12px;font-weight:600;font-size:12px;text-align:center;margin-bottom:15px;">⭐ Премиум активен</div>';
@@ -1648,7 +1887,7 @@
             if (currentAudioIndex < audioQueue.length) {
                 playCurrentTrack();
             } else {
-                if (repeatMode === 'all') {
+                if (repeatMode === 'all' || loopPlaylist) {
                     currentAudioIndex = 0;
                     playCurrentTrack();
                 } else {
@@ -1746,9 +1985,13 @@
             if(e && e.target.closest('.player-controls')) return;
             if(e && e.target.closest('.player-progress-container')) return;
             document.getElementById('full-player').classList.add('show');
+            document.body.classList.add('full-player-open'); // <--- Добавляем класс
         }
 
-        function closeFullPlayer() { document.getElementById('full-player').classList.remove('show'); }
+        function closeFullPlayer() { 
+            document.getElementById('full-player').classList.remove('show'); 
+            document.body.classList.remove('full-player-open'); // <--- Убираем класс
+        }
 
         async function requestTrack(trackId) {
             showToast("Скачиваю трек...");
@@ -1765,12 +2008,20 @@
             const listDiv = document.getElementById('playlists-list');
             listDiv.innerHTML = Array(3).fill(`<div class="skeleton-market"></div>`).join('');
             
+            // 1. ЗАПРОС СЧЕТЧИКА
+            let likesCount = 0;
+            try {
+                const likesRes = await apiFetch('/api/likes');
+                const likesData = await likesRes.json();
+                if (likesData.tracks) likesCount = likesData.tracks.length;
+            } catch(e) {}
+
             let html = `
                 <div class="playlist-row-item" onclick="viewLikedTracks()">
                     <div class="folder-icon red" style="width:64px; height:64px; border-radius:12px; background:linear-gradient(135deg, #ff0844, #ffb199); display:flex; justify-content:center; align-items:center; font-size:28px; flex-shrink:0;">❤️</div>
                     <div class="market-info" style="flex-grow:1;">
                         <div class="market-title" style="font-weight:600; font-size:16px;">Мне нравится</div>
-                        <div class="market-sub" style="font-size:13px; color:var(--text-muted);">Твоя золотая полка</div>
+                        <div class="market-sub" style="font-size:13px; color:var(--text-muted);">${likesCount} треков</div> <!-- 2. ВЫВОДИМ ЦИФРУ -->
                     </div>
                 </div>
             `;
@@ -2076,7 +2327,7 @@
         }
 
         // --- ТАКТИЛЬНОСТЬ ДЛЯ МОБИЛЬНЫХ УСТРОЙСТВ (ИСПРАВЛЕНИЕ iOS) ---
-        const touchElements = '.nav-item, .btn-search, .btn-create-pl, .premium-banner, .artist-card, .playlist-row-item, .btn-buy-market, .action-btn-modal, .sheet-action-btn, .btn-svg, .fp-btn, .fp-close, .modal-close-btn, .trailer-btn, .btn-back, .track-item, .market-card-wb, .icon-btn, .btn-levels';
+        const touchElements = '.nav-item, .btn-search, .btn-create-pl, .premium-banner, .artist-card, .playlist-row-item, .btn-buy-market, .action-btn-modal, .sheet-action-btn, .btn-svg, .fp-btn, .fp-close, .modal-close-btn, .trailer-btn, .btn-back, .track-item, .market-card-wb, .icon-btn, .btn-levels, .btn-wave';
         
         document.addEventListener('touchstart', (e) => {
             const el = e.target.closest(touchElements);
@@ -2093,6 +2344,117 @@
             if (el) el.classList.remove('pressed');
         }, { passive: true });
         // -------------------------------------------------------------
+
+        // --- НАСТРОЙКИ И ТЕМЫ ---
+        function openSettings() {
+            renderThemes();
+            document.getElementById('settings-modal').classList.add('show');
+        }
+
+        function closeSettings(e) {
+            if(e && e.target !== document.getElementById('settings-modal')) return;
+            document.getElementById('settings-modal').classList.remove('show');
+        }
+
+        function applyTheme(themeName) {
+            document.body.setAttribute('data-theme', themeName);
+        }
+
+        function renderThemes() {
+            const grid = document.getElementById('theme-grid');
+            const themes = [
+                { id: 'dark', name: 'Тёмная', price: 0 },
+                { id: 'light', name: 'Светлая', price: 50 },
+                { id: 'blue', name: 'Синяя', price: 50 }
+            ];
+
+            let html = '';
+            themes.forEach(t => {
+                const isUnlocked = userThemes.includes(t.id);
+                const isActive = activeTheme === t.id;
+                const priceText = isUnlocked ? '' : `<div class="theme-price">🪙 ${t.price}</div>`;
+                
+                html += `
+                    <div class="theme-card ${isActive ? 'active' : ''}" onclick="selectTheme('${t.id}')">
+                        <div class="theme-preview ${t.id}"></div>
+                        <div class="theme-name">${t.name}</div>
+                        ${priceText}
+                    </div>
+                `;
+            });
+            grid.innerHTML = html;
+        }
+
+        async function selectTheme(themeId) {
+            if (activeTheme === themeId) return; // Уже выбрана
+
+            // Если тема не куплена
+            if (!userThemes.includes(themeId)) {
+                if (!confirm("Купить эту тему за 50 поинтов?")) return;
+                
+                const res = await apiFetch('/api/themes/buy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ theme_name: themeId })
+                });
+                const data = await res.json();
+                
+                if (data.error) return showToast(data.error, true);
+                
+                userThemes = data.unlocked;
+                showToast("Тема куплена!");
+                fetchProfile(); // Обновляем баланс
+            }
+
+            // Применяем тему
+            activeTheme = themeId;
+            applyTheme(themeId);
+            
+            // Сохраняем на сервере
+            await apiFetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ active_theme: themeId })
+            });
+            
+            renderThemes();
+        }
+
+        async function toggleLoopSetting(checkbox) {
+            loopPlaylist = checkbox.checked;
+            await apiFetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ loop_playlist: loopPlaylist })
+            });
+        }
+
+        // --- МОЯ ВОЛНА ---
+        async function startWave() {
+            showToast("🌊 Собираю рекомендации...");
+            try {
+                const res = await apiFetch('/api/wave');
+                const data = await res.json();
+                
+                if (data.error) return showToast(data.error, true);
+                if (!data.tracks || data.tracks.length === 0) {
+                    return showToast("В базе пока мало треков для рекомендаций", true);
+                }
+
+                audioQueue = data.tracks; 
+                currentAudioIndex = 0;
+                
+                document.getElementById('trending-container').style.display = 'none';
+                document.getElementById('search-results-container').style.display = 'none';
+                document.getElementById('artist-profile-container').style.display = 'none';
+                
+                playCurrentTrack();
+                showToast("Волна запущена! 🎧");
+                
+            } catch(e) {
+                showToast("Ошибка сети при запуске Волны", true);
+            }
+        }
 
         // Запуск
         initLikes();

@@ -6,6 +6,7 @@ import os
 import secrets
 import re
 import json
+import random
 from datetime import datetime, timezone, timedelta
 from typing import Any
 from contextlib import asynccontextmanager
@@ -15,6 +16,40 @@ from backend.config import ADMIN_ID
 
 DB_DIR: str = os.path.dirname(os.path.abspath(__file__))
 DB_PATH: str = os.path.join(DB_DIR, "music_bot.db")
+
+# ============================================================
+# НОРМАЛИЗАЦИЯ АРТИСТОВ
+# ============================================================
+def normalize_artist(artist_name: str) -> str:
+    if not artist_name: return "Unknown"
+    name = artist_name.strip()
+
+    # 1. Отрезаем всё после &, feat, prod, запятой (например, "Ноггано, Купэ" -> "Ноггано")
+    name = re.split(r'\s*(?:&|feat\.?|ft\.?|prod\.?|при\s+уч\.?|,)\s*', name, flags=re.IGNORECASE)[0]
+    name = name.strip()
+
+    # 2. Словарь ручных алиасов (сюда можно добавлять любые вариации)
+    aliases = {
+        "мияги": "Miyagi",
+        "miyagi": "Miyagi",
+        "эндшпиль": "Miyagi",
+        "andy panda": "Miyagi",
+        "баста": "Баста",
+        "basta": "Баста",
+        "ноггано": "Ноггано",
+        "noggano": "Ноггано",
+        "гуф": "Гуф",
+        "guf": "Гуф",
+        "скриптонит": "Скриптонит",
+        "scriptonite": "Скриптонит"
+    }
+
+    lower_name = name.lower()
+    if lower_name in aliases:
+        return aliases[lower_name]
+
+    return name
+# ============================================================
 
 LEVEL_THRESHOLDS = ((3000, "Меценат"), (1501, "Легенда"), (601, "Куратор"), (201, "Коллекционер"), (0, "Новичок"))
 
@@ -121,7 +156,6 @@ async def init_db() -> None:
             if "xp" not in cols:
                 await conn.execute("ALTER TABLE users ADD COLUMN xp INTEGER DEFAULT 0")
                 await conn.execute("UPDATE users SET xp = points")
-            # НОВЫЕ КОЛОНКИ:
             if "active_theme" not in cols: await conn.execute("ALTER TABLE users ADD COLUMN active_theme TEXT DEFAULT 'dark'")
             if "unlocked_themes" not in cols: await conn.execute("ALTER TABLE users ADD COLUMN unlocked_themes TEXT DEFAULT '[\"dark\"]'")
             if "loop_playlist" not in cols: await conn.execute("ALTER TABLE users ADD COLUMN loop_playlist BOOLEAN DEFAULT 0")
@@ -146,6 +180,12 @@ async def init_db() -> None:
             if "original_playlist_id" not in cols: await conn.execute("ALTER TABLE user_playlists ADD COLUMN original_playlist_id INTEGER DEFAULT NULL")
             if "trailer_path" not in cols: await conn.execute("ALTER TABLE user_playlists ADD COLUMN trailer_path TEXT DEFAULT NULL")
             if "custom_cover" not in cols: await conn.execute("ALTER TABLE user_playlists ADD COLUMN custom_cover TEXT DEFAULT NULL")
+
+        # --- колонка position в таблице likes ---
+        async with conn.execute("PRAGMA table_info(likes)") as cursor:
+            cols = [r[1] for r in await cursor.fetchall()]
+            if "position" not in cols: await conn.execute("ALTER TABLE likes ADD COLUMN position INTEGER DEFAULT 0")
+
         await conn.commit()
 
 async def get_user(telegram_id: int) -> dict[str, Any]:
@@ -190,11 +230,24 @@ def _compute_file_hash(file_path: str | None, title: str, artist: str, user_id: 
     payload = f"{user_id}|{title}|{artist}|{file_path or ''}|{secrets.token_hex(8)}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+# ============================================================
+# ОБНОВЛЁННЫЙ UPLOAD_TRACK (оптимизированная проверка дубликатов)
+# ============================================================
 async def upload_track(user_id: int, title: str, artist: str, file_path: str, source: str, bitrate: int = 0, duration: int = 0, original_duration: int = 0, import_source: str = "unknown", pending_playlist_id: int = None, pending_position: int = 0, source_url: str = None) -> dict[str, Any]:
     file_hash = _compute_file_hash(file_path, title, artist, user_id)
     async with get_db() as conn:
-        async with conn.execute("SELECT id FROM tracks WHERE LOWER(artist) = LOWER(?) AND LOWER(title) = LOWER(?)", (artist, title)) as cursor:
-            if await cursor.fetchone(): raise ValueError(f"Трек '{artist} — {title}' уже есть в базе!")
+        # --- ОПТИМИЗИРОВАННАЯ ПРОВЕРКА: ищем только по title (SQL-фильтр) ---
+        t_clean = re.sub(r'[\W_]+', '', title.lower())
+        async with conn.execute("SELECT id, artist, title FROM tracks WHERE LOWER(title) = LOWER(?)", (title,)) as cursor:
+            rows = await cursor.fetchall()
+            
+        a_clean = re.sub(r'[\W_]+', '', normalize_artist(artist).lower())
+        for row in rows:
+            db_a = re.sub(r'[\W_]+', '', normalize_artist(row["artist"]).lower())
+            db_t = re.sub(r'[\W_]+', '', row["title"].lower())
+            if (a_clean in db_a or db_a in a_clean) and (t_clean in db_t or db_t in t_clean):
+                raise ValueError(f"Трек '{artist} — {title}' уже есть в базе!")
+        # ------------------------------------------------------------------
         try:
             cursor = await conn.execute(
                 """INSERT INTO tracks (title, artist, file_path, file_hash, source, source_url, uploaded_by, bitrate, duration, original_duration, import_source, status, pending_playlist_id, pending_position) 
@@ -290,20 +343,26 @@ async def increment_download_count(user_id: int, count: int) -> None:
         await conn.execute("UPDATE users SET downloads_today = downloads_today + ? WHERE id = ?", (count, user_id))
         await conn.commit()
 
+# ============================================================
+# ОБНОВЛЁННЫЙ CHECK_TRACK_EXISTS (с нормализацией + флаг "упавший")
+# ============================================================
 async def check_track_exists(artist: str, title: str) -> int | None:
     def clean(s):
         if not s: return ""
         s = str(s).lower().replace('\xa0', ' ')
-        s = re.sub(r'[^\w\s]', '', s)
-        return " ".join(s.split())
-    a_clean, t_clean = clean(artist), clean(title)
+        s = re.sub(r'[\W_]+', '', s) # Удаляем вообще все спецсимволы и пробелы
+        return s
+        
+    a_clean, t_clean = clean(normalize_artist(artist)), clean(title)
     async with get_db() as conn:
         async with conn.execute("SELECT id, artist, title, file_path FROM tracks") as cursor:
             rows = await cursor.fetchall()
         for row in rows:
             db_a, db_t = clean(row["artist"]), clean(row["title"])
+            
             a_match = (a_clean in db_a) or (db_a in a_clean)
             t_match = (t_clean in db_t) or (db_t in t_clean)
+            
             if a_match and t_match:
                 file_path = row["file_path"]
                 if file_path and os.path.isfile(file_path): 
@@ -311,7 +370,7 @@ async def check_track_exists(artist: str, title: str) -> int | None:
                 else:
                     await conn.execute("DELETE FROM tracks WHERE id = ?", (row["id"],))
                     await conn.commit()
-                    return None 
+                    return -1  # Трек был, но файл утерян/не скачался
     return None
 
 async def get_pending_tracks(limit: int = 10) -> list[dict[str, Any]]:
@@ -526,7 +585,10 @@ async def remove_playlist_from_market(playlist_id: int) -> bool:
         await conn.commit()
         return True
 
-async def toggle_like(user_id: int, track_id: int) -> bool:
+# ============================================================
+# ОБНОВЛЁННЫЙ TOGGLE_LIKE (с поддержкой position)
+# ============================================================
+async def toggle_like(user_id: int, track_id: int, position: int = 0) -> bool:
     async with get_db() as conn:
         async with conn.execute("SELECT 1 FROM likes WHERE user_id = ? AND track_id = ?", (user_id, track_id)) as cursor:
             exists = await cursor.fetchone()
@@ -535,13 +597,22 @@ async def toggle_like(user_id: int, track_id: int) -> bool:
             await conn.commit()
             return False
         else:
-            await conn.execute("INSERT INTO likes (user_id, track_id) VALUES (?, ?)", (user_id, track_id))
+            await conn.execute("INSERT INTO likes (user_id, track_id, position) VALUES (?, ?, ?)", (user_id, track_id, position))
             await conn.commit()
             return True
 
+# ============================================================
+# ОБНОВЛЁННЫЙ GET_USER_LIKED_TRACKS (сортировка по position)
+# ============================================================
 async def get_user_liked_tracks(user_id: int) -> list[dict[str, Any]]:
     async with get_db() as conn:
-        async with conn.execute("""SELECT t.id, t.artist, t.title, t.quality_status FROM likes l JOIN tracks t ON l.track_id = t.id WHERE l.user_id = ? ORDER BY l.created_at DESC""", (user_id,)) as cursor:
+        async with conn.execute("""
+            SELECT t.id, t.artist, t.title, t.quality_status 
+            FROM likes l 
+            JOIN tracks t ON l.track_id = t.id 
+            WHERE l.user_id = ? 
+            ORDER BY l.position ASC, l.rowid ASC
+        """, (user_id,)) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
 async def get_user_liked_track_ids(user_id: int) -> list[int]:
@@ -600,21 +671,18 @@ async def get_user_playlist_by_title(user_id: int, title: str) -> dict[str, Any]
             return dict(row) if row else None
 
 async def set_playlist_trailer(playlist_id: int, trailer_path: str) -> bool:
-    """Привязывает путь к трейлеру для плейлиста."""
     async with get_db() as conn:
         await conn.execute("UPDATE user_playlists SET trailer_path = ? WHERE id = ?", (trailer_path, playlist_id))
         await conn.commit()
         return True
 
 async def set_playlist_custom_cover(playlist_id: int, cover_path: str) -> bool:
-    """Привязывает путь к кастомной обложке плейлиста."""
     async with get_db() as conn:
         await conn.execute("UPDATE user_playlists SET custom_cover = ? WHERE id = ?", (cover_path, playlist_id))
         await conn.commit()
         return True
 
 async def get_similar_artists(artist_name: str, limit: int = 5) -> list[str]:
-    """Ищет артистов, которые часто встречаются в одних плейлистах с заданным."""
     async with get_db() as conn:
         query = """
             SELECT t2.artist, COUNT(*) as freq
@@ -633,7 +701,6 @@ async def get_similar_artists(artist_name: str, limit: int = 5) -> list[str]:
             return [row["artist"] for row in rows]
 
 async def get_trending_tracks(limit: int = 5) -> list[dict[str, Any]]:
-    """Возвращает самые скачиваемые треки для пустого поиска."""
     async with get_db() as conn:
         async with conn.execute(
             "SELECT * FROM tracks WHERE status = 'approved' ORDER BY download_count DESC LIMIT ?", 
@@ -641,25 +708,52 @@ async def get_trending_tracks(limit: int = 5) -> list[dict[str, Any]]:
         ) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
+# ============================================================
+# ОБНОВЛЁННЫЙ GET_TRENDING_ARTISTS (с нормализацией)
+# ============================================================
 async def get_trending_artists(limit: int = 6) -> list[dict[str, Any]]:
-    """Возвращает топ артистов по количеству скачиваний их треков."""
     async with get_db() as conn:
-        async with conn.execute(
-            """SELECT artist, SUM(download_count) as total_downloads, MAX(id) as top_track_id 
-               FROM tracks WHERE status = 'approved' 
-               GROUP BY artist ORDER BY total_downloads DESC LIMIT ?""", 
-            (limit,)
-        ) as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
+        async with conn.execute("SELECT * FROM tracks WHERE status = 'approved'") as cursor:
+            all_tracks = await cursor.fetchall()
+    
+    artist_stats = {}
+    for t in all_tracks:
+        norm_name = normalize_artist(t["artist"])
+        if norm_name not in artist_stats:
+            artist_stats[norm_name] = {
+                "artist": norm_name, 
+                "total_downloads": 0, 
+                "top_track_id": t["id"], 
+                "max_downloads": -1
+            }
+        
+        downloads = t["download_count"] or 0
+        artist_stats[norm_name]["total_downloads"] += downloads
+        
+        if downloads > artist_stats[norm_name]["max_downloads"]:
+            artist_stats[norm_name]["max_downloads"] = downloads
+            artist_stats[norm_name]["top_track_id"] = t["id"]
+    
+    sorted_artists = sorted(artist_stats.values(), key=lambda x: x["total_downloads"], reverse=True)
+    return sorted_artists[:limit]
 
+# ============================================================
+# ОБНОВЛЁННЫЙ GET_TRACKS_BY_ARTIST (с нормализацией)
+# ============================================================
 async def get_tracks_by_artist(artist_name: str, limit: int = 20) -> list[dict[str, Any]]:
-    """Возвращает треки конкретного артиста."""
+    target_norm = normalize_artist(artist_name)
+    
     async with get_db() as conn:
-        async with conn.execute(
-            "SELECT * FROM tracks WHERE LOWER(artist) = LOWER(?) AND status = 'approved' ORDER BY download_count DESC LIMIT ?", 
-            (artist_name, limit)
-        ) as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
+        async with conn.execute("SELECT * FROM tracks WHERE status = 'approved'") as cursor:
+            all_tracks = await cursor.fetchall()
+            
+        matching_tracks = []
+        for t in all_tracks:
+            if normalize_artist(t["artist"]) == target_norm:
+                matching_tracks.append(dict(t))
+                
+        matching_tracks.sort(key=lambda x: x.get("download_count", 0), reverse=True)
+        return matching_tracks[:limit]
 
 async def set_track_file_id(track_id: int, file_id: str) -> None:
     async with get_db() as conn:
@@ -704,3 +798,58 @@ async def buy_theme(user_id: int, theme_name: str, price: int) -> dict:
             await conn.commit()
             
             return {"ok": True, "msg": "Тема успешно куплена!", "unlocked": unlocked}
+
+# ============================================================
+# "МОЯ ВОЛНА"
+# ============================================================
+async def get_wave_recommendations(user_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    async with get_db() as conn:
+        async with conn.execute("""
+            SELECT t.artist FROM likes l 
+            JOIN tracks t ON l.track_id = t.id 
+            WHERE l.user_id = ?
+        """, (user_id,)) as cursor:
+            liked_artists = [row["artist"] for row in await cursor.fetchall()]
+            
+        async with conn.execute("""
+            SELECT pt.track_id FROM playlist_tracks pt
+            JOIN user_playlists p ON pt.playlist_id = p.id
+            WHERE p.user_id = ?
+        """, (user_id,)) as cursor:
+            existing_tracks = [row["track_id"] for row in await cursor.fetchall()]
+
+        recommended_tracks = []
+        seen_ids = set(existing_tracks)
+        
+        if not liked_artists:
+            async with conn.execute("SELECT * FROM tracks WHERE status = 'approved' ORDER BY download_count DESC LIMIT ?", (limit,)) as cursor:
+                return [dict(row) for row in await cursor.fetchall()]
+
+        unique_artists = list(set(liked_artists))[:5]
+        for artist in unique_artists:
+            async with conn.execute("""
+                SELECT * FROM tracks 
+                WHERE LOWER(artist) LIKE LOWER(?) AND status = 'approved'
+                ORDER BY download_count DESC LIMIT 5
+            """, (f"%{artist}%",)) as cursor:
+                for row in await cursor.fetchall():
+                    if row["id"] not in seen_ids:
+                        recommended_tracks.append(dict(row))
+                        seen_ids.add(row["id"])
+
+        needed = limit - len(recommended_tracks)
+        if needed > 0:
+            async with conn.execute("""
+                SELECT * FROM tracks 
+                WHERE status = 'approved' 
+                ORDER BY RANDOM() LIMIT ?
+            """, (needed * 2,)) as cursor:
+                for row in await cursor.fetchall():
+                    if row["id"] not in seen_ids:
+                        recommended_tracks.append(dict(row))
+                        seen_ids.add(row["id"])
+                    if len(recommended_tracks) >= limit:
+                        break
+        
+        random.shuffle(recommended_tracks)
+        return recommended_tracks[:limit]

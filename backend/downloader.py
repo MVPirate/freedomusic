@@ -2,6 +2,8 @@ import os
 import asyncio
 import yt_dlp
 import requests
+import json
+import random
 from pathlib import Path
 import logging
 import uuid
@@ -13,8 +15,21 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOADS_DIR = BASE_DIR / "uploads"
 FFMPEG_PATH = BASE_DIR / "ffmpeg.exe"
+TRUSTED_FILE = Path(__file__).resolve().parent / "trusted_artists.json"
+PROXIES_FILE = Path(__file__).resolve().parent / "proxies.txt"
 
 BAD_WORDS = ['8d', '8 d', '8-d', '8d audio', 'echo', 'эхо', 'cover', 'instrumental', 'минус', 'кавер']
+
+def _load_proxies() -> list[str]:
+    """Загружает список прокси из backend/proxies.txt (построчно)."""
+    if not PROXIES_FILE.exists():
+        return []
+    try:
+        with open(PROXIES_FILE, 'r', encoding='utf-8') as f:
+            return [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+    except Exception as e:
+        logger.error(f"Ошибка чтения proxies.txt: {e}")
+        return []
 
 def _get_ydl_opts(base_path: Path):
     return {
@@ -40,57 +55,81 @@ def _sync_download(artist: str, title: str, filename: str) -> tuple[str | None, 
     base_path = UPLOADS_DIR / filename
     ydl_opts = _get_ydl_opts(base_path)
     
-    # Очищаем названия для сравнения
     clean_req_title = re.sub(r'[^\w\s]', '', title.lower()).strip()
 
-    try:
-        with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
-            result = ydl.extract_info(f"scsearch10:{artist} - {title} audio", download=False)
-            entries = result.get('entries', [])
-            
-        for entry in entries:
-            entry_title = entry.get('title', '')
-            entry_title_lower = entry_title.lower()
-            url = entry.get('url')
-            duration = entry.get('duration', 0)
-            
-            if not url or (duration and duration < 60): continue
-            if any(bad_word in entry_title_lower for bad_word in BAD_WORDS): continue
+    # --- ПРОВЕРКА БЕЛОГО СПИСКА ---
+    artist_url = None
+    if TRUSTED_FILE.exists():
+        try:
+            # utf-8-sig — чтобы не спотыкаться на BOM (PowerShell, Блокнот и т.п.)
+            with open(TRUSTED_FILE, 'r', encoding='utf-8-sig') as f:
+                trusted = json.load(f)
+                if artist in trusted:
+                    artist_url = trusted[artist]
+                    logger.info(f"⭐ {artist} в белом списке. Ищу на официальной странице.")
+        except Exception as e:
+            logger.error(f"Ошибка чтения белого списка: {e}")
 
-            # --- ПРОВЕРКА СХОЖЕСТИ НАЗВАНИЙ ---
-            clean_entry_title = re.sub(r'[^\w\s]', '', entry_title_lower).strip()
-            
-            # Проверяем, входит ли искомое название в найденное или наоборот
-            if clean_req_title not in clean_entry_title and clean_entry_title not in clean_req_title:
-                # Если не входит, проверяем общую схожесть (для опечаток)
-                ratio = difflib.SequenceMatcher(None, clean_req_title, clean_entry_title).ratio()
-                if ratio < 0.65: # Если совпадение меньше 65%, пропускаем
-                    logger.info(f"Пропущен трек '{entry_title}', так как не похож на '{title}'")
-                    continue
-            
-            webpage_url = None
-            try:
-                with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl_meta:
-                    info = ydl_meta.extract_info(url, download=False, process=False)
-                    if info:
-                        webpage_url = info.get('webpage_url') or info.get('permalink_url')
-            except Exception:
-                pass
+    # Вспомогательная функция для поиска (чтобы не дублировать код)
+    def try_search(query_url: str) -> tuple[str | None, str | None, str | None]:
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
+                result = ydl.extract_info(query_url, download=False)
+                entries = result.get('entries', [])
+                
+            for entry in entries:
+                entry_title = entry.get('title', '')
+                entry_title_lower = entry_title.lower()
+                url = entry.get('url')
+                duration = entry.get('duration', 0)
+                
+                if not url or (duration and duration < 60): continue
+                if any(bad_word in entry_title_lower for bad_word in BAD_WORDS): continue
 
-            final_source_url = webpage_url or url
+                clean_entry_title = re.sub(r'[^\w\s]', '', entry_title_lower).strip()
+                if clean_req_title not in clean_entry_title and clean_entry_title not in clean_req_title:
+                    ratio = difflib.SequenceMatcher(None, clean_req_title, clean_entry_title).ratio()
+                    if ratio < 0.65: continue
+                
+                webpage_url = None
+                try:
+                    with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl_meta:
+                        info = ydl_meta.extract_info(url, download=False, process=False)
+                        if info: webpage_url = info.get('webpage_url') or info.get('permalink_url')
+                except Exception: pass
 
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-                mp3_path = base_path.with_suffix('.mp3')
-                if mp3_path.exists():
-                    return str(mp3_path), None, final_source_url
-            except Exception as e:
-                if "DRM" in str(e): continue
-    except Exception as e:
-        logger.error(f"Ошибка поиска SoundCloud: {e}")
+                final_source_url = webpage_url or url
 
-    return None, "error", None
+                try:
+                    # Загружаем прокси из файла (если он есть)
+                    proxy_list = _load_proxies()
+
+                    # Если прокси есть, выбираем случайный и передаем в yt-dlp
+                    current_proxy = random.choice(proxy_list) if proxy_list else None
+                    if current_proxy:
+                        ydl_opts['proxy'] = current_proxy
+                        logger.info(f"Использую прокси: {current_proxy}")
+
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([url])
+                    mp3_path = base_path.with_suffix('.mp3')
+                    if mp3_path.exists():
+                        return str(mp3_path), None, final_source_url
+                except Exception as e:
+                    if "DRM" in str(e): continue
+        except Exception as e:
+            logger.error(f"Ошибка поиска по {query_url}: {e}")
+        return None, "error", None
+
+    # 1. Пытаемся искать на странице артиста (если он в белом списке)
+    if artist_url:
+        file_path, err, src_url = try_search(f"{artist_url}/tracks")
+        if file_path:
+            return file_path, err, src_url
+        logger.info(f"На странице {artist} ничего не нашли или DRM. Переключаюсь на общий поиск...")
+
+    # 2. Фолбэк: Обычный поиск по SoundCloud
+    return try_search(f"scsearch10:{artist} - {title} audio")
 
 async def download_track_from_youtube(artist: str, title: str) -> tuple[str | None, str | None, str | None]:
     safe_name = "".join(c for c in f"{artist} - {title}" if c.isalnum() or c in " -_").strip()
