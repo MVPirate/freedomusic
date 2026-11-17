@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse, FileResponse, Response, RedirectResp
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import logging
+from html import escape as esc
 from pathlib import Path
 from mutagen import File as MutagenFile
 import hmac
@@ -10,6 +11,8 @@ import hashlib
 import time
 
 from aiogram import Bot
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.types import FSInputFile, LabeledPrice
 from aiogram.utils.web_app import safe_parse_webapp_init_data
 
@@ -33,7 +36,7 @@ from backend.database import (
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 app.add_middleware(
     CORSMiddleware,
@@ -298,7 +301,7 @@ async def api_download(track_id: int, request: Request):
         return {"error": "Трек не найден или на модерации"}
             
     quality = track["quality_status"] if track["quality_status"] != 'none' else 'Verified'
-    caption = f"🎵 {track['artist']} — {track['title']}\n⭐ Качество: {quality}"
+    caption = f"🎵 {esc(track['artist'])} — {esc(track['title'])}\n⭐ Качество: {esc(str(quality))}"
     
     if track.get("file_id"):
         await bot.send_audio(chat_id=tg_id, audio=track["file_id"], caption=caption, title=track['title'], performer=track['artist'])
@@ -436,10 +439,9 @@ async def api_request_trailer(playlist_id: int, request: Request, pl: dict = Dep
     try:
         await bot.send_message(
             chat_id=tg_id,
-            text=f"🎵 Отправь мне аудиофайл для трейлера плейлиста **{playlist['title']}** (ID: {playlist['id']})\n\n"
-                 f"⚠️ **В ответ на это сообщение!** (нажми на него и выбери 'Ответить', затем прикрепи MP3 или файл).\n"
-                 f"Размер файла: до 3 МБ. Длительность: до 30 секунд.",
-            parse_mode="Markdown"
+            text=f"🎵 Отправь мне аудиофайл для трейлера плейлиста <b>{esc(playlist['title'])}</b> (ID: {playlist['id']})\n\n"
+                 f"⚠️ <b>В ответ на это сообщение!</b> (нажми на него и выбери 'Ответить', затем прикрепи MP3 или файл).\n"
+                 f"Размер файла: до 3 МБ. Длительность: до 30 секунд."
         )
         return {"ok": True}
     except Exception as e:
@@ -474,10 +476,9 @@ async def api_request_cover(playlist_id: int, request: Request, pl: dict = Depen
     try:
         await bot.send_message(
             chat_id=tg_id,
-            text=f"🖼 Отправь мне картинку для обложки плейлиста **{playlist['title']}** (ID: {playlist['id']})\n\n"
-                 f"⚠️ **В ответ на это сообщение!** (нажми на него и выбери 'Ответить', затем прикрепи фото).\n"
-                 f"Размер файла: до 5 МБ.",
-            parse_mode="Markdown"
+            text=f"🖼 Отправь мне картинку для обложки плейлиста <b>{esc(playlist['title'])}</b> (ID: {playlist['id']})\n\n"
+                 f"⚠️ <b>В ответ на это сообщение!</b> (нажми на него и выбери 'Ответить', затем прикрепи фото).\n"
+                 f"Размер файла: до 5 МБ."
         )
         return {"ok": True}
     except Exception as e:
