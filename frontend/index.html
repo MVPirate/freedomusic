@@ -290,13 +290,27 @@ h1, h2, h3 { margin: 0; font-weight: 700; }
   padding: 12px;
   display: flex;
   align-items: center;
-  gap: 15px;
   position: relative;
   overflow: hidden;
-  cursor: pointer;
+  /* Убрали cursor: pointer отсюда, перенесли в track-main */
   transition: transform 0.1s ease, background 0.2s ease;
 }
-.track-item:active { transform: scale(0.98); background: rgba(44, 44, 46, 0.8); }
+
+/* Новая зона для клика (обложка + текст) */
+.track-main {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  flex-grow: 1;
+  min-width: 0; /* Важно для работы многоточия в тексте */
+  cursor: pointer;
+  height: 100%;
+}
+
+.track-main:active {
+  opacity: 0.8;
+}
+.track-main:active { transform: scale(0.98); }
 .track-cover {
   width: 64px;
   height: 64px;
@@ -329,7 +343,19 @@ h1, h2, h3 { margin: 0; font-weight: 700; }
   align-items: center;
   gap: 4px;
 }
-.track-actions { display: flex; flex-direction: row; align-items: center; gap: 4px; flex-shrink: 0; }
+/* Зона с кнопками и разделительная полоска */
+.track-actions {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  border-left: 1px solid rgba(255, 255, 255, 0.1); /* Полоска */
+  padding-left: 10px;
+  margin-left: 10px;
+  position: relative;
+  z-index: 100;
+}
 
 .icon-btn {
   background: transparent;
@@ -2448,6 +2474,17 @@ body[data-theme="light"] .new-theme-name.light-text { color: #333; }
     <svg class="nav-icon" viewBox="0 0 24 24"><path d="M7 18c-1.1 0-1.99.9-1.99 2S5.9 22 7 22s2-.9 2-2-.9-2-2-2zM1 2v2h2l3.6 7.59-1.35 2.45c-.16.28-.25.61-.25.96 0 1.1.9 2 2 2h12v-2H7.42c-.14 0-.25-.11-.25-.25l.03-.12.9-1.63h7.45c.75 0 1.41-.41 1.75-1.03l3.58-6.49c.08-.14.12-.31.12-.48 0-.55-.45-1-1-1H5.21l-.94-2H1zm16 16c-1.1 0-1.99.9-1.99 2s.89 2 1.99 2 2-.9 2-2-.9-2-2-2z"/></svg>
     <span class="nav-label">Маркетплейс</span>
   </div>
+  <div class="nav-item" id="nav-admin" onclick="switchTab('admin')" style="display: none;">
+    <svg class="nav-icon" viewBox="0 0 24 24"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z"/></svg>
+    <span class="nav-label">Админ</span>
+  </div>
+</div>
+
+<div id="tab-admin" class="tab-content" style="padding: 15px;">
+    <h2 style="margin-bottom: 15px; text-align: center; color: var(--text);">👑 Модерация</h2>
+    <div id="admin-track-list">
+        <p style="text-align: center; color: gray;">Загрузка...</p>
+    </div>
 </div>
 
 <!-- ============================================ -->
@@ -2648,13 +2685,16 @@ function showToast(message, isError = false) {
 // НАВИГАЦИЯ
 // ============================================
 function switchTab(tabName) {
-  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-  document.getElementById(`tab-${tabName}`).classList.add('active');
-  document.getElementById(`nav-${tabName}`).classList.add('active');
-  if (tabName === 'playlists') loadPlaylists();
-  if (tabName === 'market') loadMarket();
-  if (tabName === 'search') closeArtistProfile();
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+    
+    document.getElementById(`tab-${tabName}`).classList.add('active');
+    document.getElementById(`nav-${tabName}`).classList.add('active');
+    
+    if (tabName === 'playlists') loadPlaylists();
+    if (tabName === 'market') loadMarket();
+    if (tabName === 'search') closeArtistProfile();
+    if (tabName === 'admin') loadAdminPanel(); 
 }
 
 // ============================================
@@ -2670,54 +2710,60 @@ if (user) {
 }
 
 async function fetchProfile() {
-  try {
-    const response = await apiFetch('/api/profile');
-    const data = await response.json();
-    if (data.error) return;
+    try {
+        const response = await apiFetch('/api/profile');
+        const data = await response.json();
+        if (data.error) return;
+        
+        userPoints = data.points;
+        document.getElementById('user-points').innerText = data.points.toLocaleString('ru-RU');
 
-    userPoints = data.points;
-    document.getElementById('user-points').innerText = data.points.toLocaleString('ru-RU');
-    const marketBalance = document.getElementById('market-balance-points');
-    if (marketBalance) marketBalance.innerText = data.points.toLocaleString('ru-RU');
-    document.getElementById('user-level').innerText = data.level;
+        if (data.is_admin) {
+            const adminBtn = document.getElementById('nav-admin');
+            if (adminBtn) adminBtn.style.display = 'flex'; 
+        }
+        
+        const marketBalance = document.getElementById('market-balance-points');
+        if (marketBalance) marketBalance.innerText = data.points.toLocaleString('ru-RU');
+        document.getElementById('user-level').innerText = data.level;
+        
+        const levelNames = ['Новичок', 'Коллекционер', 'Куратор', 'Легенда', 'Меценат'];
+        const levelIndex = levelNames.indexOf(data.level);
+        const levelNumberEl = document.getElementById('user-level-number');
+        if (levelNumberEl) levelNumberEl.innerText = ` ${levelIndex + 1} `;
 
-    const levelNames = ['Новичок', 'Коллекционер', 'Куратор', 'Легенда', 'Меценат'];
-    const levelIndex = levelNames.indexOf(data.level);
-    const levelNumberEl = document.getElementById('user-level-number');
-    if (levelNumberEl) levelNumberEl.innerText = `Ур. ${levelIndex + 1}`;
+        document.querySelectorAll('[id^="lvl-"]').forEach(el => el.style.color = 'var(--text-muted)');
+        const currentLvlEl = document.getElementById(`lvl-${data.level}`);
+        if (currentLvlEl) currentLvlEl.style.color = 'var(--blue)';
 
-    document.querySelectorAll('[id^="lvl-"]').forEach(el => el.style.color = 'var(--text-muted)');
-    const currentLvlEl = document.getElementById(`lvl-${data.level}`);
-    if (currentLvlEl) currentLvlEl.style.color = 'var(--blue)';
+        if (data.level_progress) {
+            const lp = data.level_progress;
+            document.getElementById('level-progress-bar').style.width = `${lp.progress_percent}%`;
+            const xpTextEl = document.getElementById('level-xp-text');
+            if (lp.remaining > 0) {
+                if (xpTextEl) xpTextEl.innerText = `${data.xp} XP (до следующего: ${lp.remaining} XP)`;
+            } else {
+                if (xpTextEl) xpTextEl.innerText = `Максимальный уровень! (${data.xp} XP)`;
+            }
+        }
 
-    if (data.level_progress) {
-      const lp = data.level_progress;
-      document.getElementById('level-progress-bar').style.width = `${lp.progress_percent}%`;
-      const xpTextEl = document.getElementById('level-xp-text');
-      if (lp.remaining > 0) {
-        if (xpTextEl) xpTextEl.innerText = `${data.xp} XP (до следующего: ${lp.remaining} XP)`;
-      } else {
-        if (xpTextEl) xpTextEl.innerText = `Максимальный уровень! (${data.xp} XP)`;
-      }
+        activeTheme = data.active_theme || 'dark';
+        userThemes = data.unlocked_themes || ['dark'];
+        loopPlaylist = data.loop_playlist || false;
+        const loopToggle = document.getElementById('loop-playlist-toggle');
+        if (loopToggle) loopToggle.checked = loopPlaylist;
+        applyTheme(activeTheme);
+
+        if (data.is_premium) {
+            document.getElementById('premium-status').innerHTML = '<div style="background:var(--card-bg);color:var(--gold);padding:8px;border-radius:12px;font-weight:600;font-size:12px;text-align:center;margin-bottom:15px;">⭐ Премиум активен</div>';
+            document.getElementById('buy-premium-btn').style.display = 'none';
+        } else {
+            document.getElementById('premium-status').innerHTML = '';
+            document.getElementById('buy-premium-btn').style.display = 'flex';
+        }
+    } catch(e) {
+        console.error("Ошибка загрузки профиля:", e);
     }
-
-    activeTheme = data.active_theme || 'dark';
-    userThemes = data.unlocked_themes || ['dark'];
-    loopPlaylist = data.loop_playlist || false;
-    const loopToggle = document.getElementById('loop-playlist-toggle');
-    if (loopToggle) loopToggle.checked = loopPlaylist;
-    applyTheme(activeTheme);
-
-    if (data.is_premium) {
-      document.getElementById('premium-status').innerHTML = '<div style="background:var(--card-bg);color:var(--gold);padding:8px;border-radius:12px;font-weight:600;font-size:12px;text-align:center;margin-bottom:15px;">⭐ Премиум активен</div>';
-      document.getElementById('buy-premium-btn').style.display = 'none';
-    } else {
-      document.getElementById('premium-status').innerHTML = '';
-      document.getElementById('buy-premium-btn').style.display = 'flex';
-    }
-  } catch (e) {
-    console.error('Ошибка загрузки профиля:', e);
-  }
 }
 
 // ============================================
@@ -2904,19 +2950,21 @@ async function viewArtist(artistName, coverId) {
       if (track.is_liked) userLikes.add(track.id);
       const likedClass = userLikes.has(track.id) ? 'liked' : '';
       html += `
-        <div class="track-item fade-in-item" onclick="playFromArtist(${index})">
-          <img src="/api/cover/${track.id}" class="track-cover" loading="lazy" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
-          <div class="track-info">
-            <div class="track-title">${escapeHTML(track.title)}</div>
-            <div class="track-artist">${escapeHTML(track.artist)}</div>
-            <div class="track-badge">⭐ ${escapeHTML(track.quality)}</div>
+        <div class="track-item fade-in-item">
+          <div class="track-main" onclick="handleTrackClick(event, ${index}, 'artist')">
+            <img src="/api/cover/${track.id}" class="track-cover" loading="lazy" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
+            <div class="track-info">
+              <div class="track-title">${escapeHTML(track.title)}</div>
+              <div class="track-artist">${escapeHTML(track.artist)}</div>
+              <div class="track-badge">⭐ ${escapeHTML(track.quality)}</div>
+            </div>
           </div>
           <div class="track-actions">
-            <button class="icon-btn ${likedClass}" onclick="event.stopPropagation(); toggleLike(${track.id}, this)">
-              <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+            <button class="icon-btn ${likedClass}" onpointerdown="event.stopPropagation(); event.preventDefault(); toggleLike(${track.id}, this)">
+              <svg style="pointer-events: none;" viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
             </button>
-            <button class="icon-btn" onclick="event.stopPropagation(); openTrackSheet(${index}, null, 'artist')" title="Действия">
-              <svg viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
+            <button class="icon-btn" onpointerdown="event.stopPropagation(); event.preventDefault(); openTrackSheet(${index}, null, 'artist')" title="Действия">
+              <svg style="pointer-events: none;" viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
             </button>
           </div>
         </div>
@@ -2974,19 +3022,21 @@ async function searchMusic() {
       if (track.is_liked) userLikes.add(track.id);
       const likedClass = userLikes.has(track.id) ? 'liked' : '';
       html += `
-        <div class="track-item fade-in-item" onclick="playFromList(${index})">
-          <img src="/api/cover/${track.id}" class="track-cover" loading="lazy" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
-          <div class="track-info">
-            <div class="track-title">${escapeHTML(track.title)}</div>
-            <div class="track-artist">${escapeHTML(track.artist)}</div>
-            <div class="track-badge">⭐ ${escapeHTML(track.quality)}</div>
+        <div class="track-item fade-in-item">
+          <div class="track-main" onclick="handleTrackClick(event, ${index}, 'search')">
+            <img src="/api/cover/${track.id}" class="track-cover" loading="lazy" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
+            <div class="track-info">
+              <div class="track-title">${escapeHTML(track.title)}</div>
+              <div class="track-artist">${escapeHTML(track.artist)}</div>
+              <div class="track-badge">⭐ ${escapeHTML(track.quality)}</div>
+            </div>
           </div>
           <div class="track-actions">
-            <button class="icon-btn ${likedClass}" onclick="event.stopPropagation(); toggleLike(${track.id}, this)">
-              <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+            <button class="icon-btn ${likedClass}" onpointerdown="event.stopPropagation(); event.preventDefault(); toggleLike(${track.id}, this)">
+              <svg style="pointer-events: none;" viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
             </button>
-            <button class="icon-btn" onclick="event.stopPropagation(); openTrackSheet(${index}, null, 'search')" title="Действия">
-              <svg viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
+            <button class="icon-btn" onpointerdown="event.stopPropagation(); event.preventDefault(); openTrackSheet(${index}, null, 'search')" title="Действия">
+              <svg style="pointer-events: none;" viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
             </button>
           </div>
         </div>
@@ -3596,19 +3646,21 @@ async function viewLikedTracks() {
       data.tracks.forEach((track, index) => {
         const quality = track.quality_status !== 'none' ? track.quality_status : 'Verified';
         html += `
-          <div class="track-item fade-in-item" onclick="playFromList(${index})">
-            <img src="/api/cover/${track.id}" class="track-cover" loading="lazy" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
-            <div class="track-info">
-              <div class="track-title">${escapeHTML(track.title)}</div>
-              <div class="track-artist">${escapeHTML(track.artist)}</div>
-              <div class="track-badge">⭐ ${escapeHTML(quality)}</div>
+          <div class="track-item fade-in-item">
+            <div class="track-main" onclick="handleTrackClick(event, ${index}, 'likes')">
+              <img src="/api/cover/${track.id}" class="track-cover" loading="lazy" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
+              <div class="track-info">
+                <div class="track-title">${escapeHTML(track.title)}</div>
+                <div class="track-artist">${escapeHTML(track.artist)}</div>
+                <div class="track-badge">⭐ ${escapeHTML(quality)}</div>
+              </div>
             </div>
             <div class="track-actions">
-              <button class="icon-btn liked" onclick="event.stopPropagation(); toggleLike(${track.id}, this)">
-                <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+              <button class="icon-btn liked" onpointerdown="event.stopPropagation(); event.preventDefault(); toggleLike(${track.id}, this)">
+                <svg style="pointer-events: none;" viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
               </button>
-              <button class="icon-btn" onclick="event.stopPropagation(); openTrackSheet(${index}, null, 'likes')" title="Действия">
-                <svg viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
+              <button class="icon-btn" onpointerdown="event.stopPropagation(); event.preventDefault(); openTrackSheet(${index}, null, 'likes')" title="Действия">
+                <svg style="pointer-events: none;" viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
               </button>
             </div>
           </div>
@@ -3763,19 +3815,21 @@ async function viewPlaylist(playlistId, title, salesCount) {
         const quality = track.quality_status !== 'none' ? track.quality_status : 'Verified';
         const isLiked = userLikes.has(track.id) ? 'liked' : '';
         html += `
-          <div class="track-item fade-in-item" onclick="playFromList(${index})">
-            <img src="/api/cover/${track.id}" class="track-cover" loading="lazy" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
-            <div class="track-info">
-              <div class="track-title">${escapeHTML(track.title)}</div>
-              <div class="track-artist">${escapeHTML(track.artist)}</div>
-              <div class="track-badge">⭐ ${escapeHTML(quality)}</div>
+          <div class="track-item fade-in-item">
+            <div class="track-main" onclick="handleTrackClick(event, ${index}, 'playlist')">
+              <img src="/api/cover/${track.id}" class="track-cover" loading="lazy" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
+              <div class="track-info">
+                <div class="track-title">${escapeHTML(track.title)}</div>
+                <div class="track-artist">${escapeHTML(track.artist)}</div>
+                <div class="track-badge">⭐ ${escapeHTML(quality)}</div>
+              </div>
             </div>
             <div class="track-actions">
-              <button class="icon-btn ${isLiked}" onclick="event.stopPropagation(); toggleLike(${track.id}, this)">
-                <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+              <button class="icon-btn ${isLiked}" onpointerdown="event.stopPropagation(); event.preventDefault(); toggleLike(${track.id}, this)">
+                <svg style="pointer-events: none;" viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
               </button>
-              <button class="icon-btn" onclick="event.stopPropagation(); openTrackSheet(${index}, ${playlistId}, 'playlist')" title="Действия">
-                <svg viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
+              <button class="icon-btn" onpointerdown="event.stopPropagation(); event.preventDefault(); openTrackSheet(${index}, ${playlistId}, 'playlist')" title="Действия">
+                <svg style="pointer-events: none;" viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
               </button>
             </div>
           </div>
@@ -3896,7 +3950,7 @@ function playTrailer(playlistId, playlistTitle) {
 // ============================================
 // ТАКТИЛЬНОСТЬ
 // ============================================
-const touchElements = '.nav-item, .btn-search, .btn-create-pl, .premium-banner, .artist-card, .playlist-row-item, .btn-buy-market, .action-btn-modal, .sheet-action-btn, .btn-svg, .fp-btn, .fp-close, .modal-close-btn, .trailer-btn, .btn-back, .track-item, .market-card-wb, .icon-btn, .btn-levels, .btn-wave, .tactile-btn';
+const touchElements = '.nav-item, .btn-search, .btn-create-pl, .premium-banner, .artist-card, .playlist-row-item, .btn-buy-market, .action-btn-modal, .sheet-action-btn, .btn-svg, .fp-btn, .fp-close, .modal-close-btn, .trailer-btn, .btn-back, .track-item, .track-main, .market-card-wb, .btn-levels, .btn-wave, .tactile-btn';
 document.addEventListener('touchstart', (e) => {
   const el = e.target.closest(touchElements);
   if (el) el.classList.add('pressed');
@@ -4071,12 +4125,81 @@ function handleStartParam() {
 }
 
 // ============================================
+// ОБРАБОТКА КЛИКА ПО ТРЕКУ
+// ============================================
+function handleTrackClick(event, index, context) {
+    // Если клик был по кнопкам (лайк, три точки), ничего не делаем
+    if (event.target.closest('.track-actions')) return;
+    
+    // Воспроизводим трек в зависимости от контекста
+    if (context === 'artist') {
+        playFromArtist(index);
+    } else {
+        playFromList(index); // Для search, likes, playlist
+    }
+}
+
+// ============================================
 // ИНИЦИАЛИЗАЦИЯ ПРИЛОЖЕНИЯ
 // ============================================
 initLikes();
 fetchProfile();
 handleStartParam();
 loadTrending();
+
+// Функция загрузки списка треков на модерацию
+async function loadAdminPanel() {
+    const container = document.getElementById('admin-track-list');
+    if (!container) return; 
+    container.innerHTML = '<p style="text-align: center; color: gray;">Загрузка...</p>';
+    try {
+        const res = await apiFetch('/api/admin/pending');
+        const data = await res.json();
+        
+        if (data.error) throw new Error(data.error);
+        
+        if (!data.tracks || data.tracks.length === 0) {
+            container.innerHTML = '<p style="text-align: center; color: gray;">🎉 Очередь пуста!</p>';
+            return;
+        }
+        
+        let html = '';
+        for (const track of data.tracks) {
+            html += `
+                <div style="background: #1c1c1e; border-radius: 12px; padding: 15px; margin-bottom: 15px; border: 1px solid #333;">
+                    <h4 style="margin: 0 0 5px 0; color: #fff;">${track.artist} — ${track.title}</h4>
+                    <p style="margin: 0 0 10px 0; font-size: 12px; color: #888;">
+                        ID: ${track.id} | Источник: ${track.import_source || 'unknown'}
+                    </p>
+                    <div style="display: flex; gap: 10px;">
+                        <button onclick="moderateTrack(${track.id}, 'approve')" style="flex: 1; padding: 10px; background: #34c759; color: white; border: none; border-radius: 8px; font-weight: bold; cursor: pointer;">✅ Одобрить</button>
+                        <button onclick="moderateTrack(${track.id}, 'reject')" style="flex: 1; padding: 10px; background: #ff3b30; color: white; border: none; border-radius: 8px; font-weight: bold; cursor: pointer;">❌ Отклонить</button>
+                    </div>
+                </div>
+            `;
+        }
+        container.innerHTML = html;
+    } catch (e) {
+        container.innerHTML = `<p style="color: #ff3b30; text-align: center;">Ошибка: ${e.message}</p>`;
+    }
+}
+
+// Функция одобрения/отклонения трека
+async function moderateTrack(trackId, action) {
+    try {
+        const res = await apiFetch(`/api/admin/${action}/${trackId}`, { method: 'POST' });
+        const data = await res.json();
+        
+        if (data.ok) {
+            if (typeof showToast === 'function') showToast(data.msg || 'Успешно!'); 
+            loadAdminPanel(); 
+        } else {
+            if (typeof showToast === 'function') showToast(data.error || 'Ошибка при выполнении', true);
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Ошибка сети', true);
+    }
+}
 </script>
 </body>
 </html>

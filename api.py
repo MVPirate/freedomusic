@@ -30,7 +30,7 @@ from backend.database import (
     get_trending_artists, get_tracks_by_artist, set_track_file_id,
     update_user_settings, buy_theme,
     get_wave_recommendations,
-    is_premium_active
+    is_premium_active,get_pending_tracks, update_track_status, delete_track
 )
 
 logger = logging.getLogger(__name__)
@@ -169,7 +169,8 @@ async def get_profile(request: Request):
         "level_progress": level_info,
         "active_theme": user.get("active_theme", "dark"),
         "unlocked_themes": unlocked,
-        "loop_playlist": bool(user.get("loop_playlist", 0))
+        "loop_playlist": bool(user.get("loop_playlist", 0)),
+        "is_admin": user["telegram_id"] == ADMIN_ID
     }
 
 @app.post("/api/claim_daily")
@@ -627,6 +628,35 @@ async def api_buy_theme(request: Request):
     
     result = await buy_theme(int(user["id"]), theme_name, 50)
     return result
+
+# ==========================================
+# АДМИН-ПАНЕЛЬ (API)
+# ==========================================
+@app.get("/api/admin/pending")
+async def api_admin_pending(request: Request):
+    tg_id = await get_tg_user_id(request)
+    if tg_id != ADMIN_ID: return {"error": "Нет прав"}
+    
+    tracks = await get_pending_tracks(limit=20)
+    return {"tracks": tracks}
+
+@app.post("/api/admin/approve/{track_id}")
+async def api_admin_approve(track_id: int, request: Request):
+    tg_id = await get_tg_user_id(request)
+    if tg_id != ADMIN_ID: return {"error": "Нет прав"}
+    
+    user = await get_user(tg_id)
+    await update_track_status(track_id, "approved", int(user["id"]))
+    return {"ok": True, "msg": "Трек одобрен"}
+
+@app.post("/api/admin/reject/{track_id}")
+async def api_admin_reject(track_id: int, request: Request):
+    tg_id = await get_tg_user_id(request)
+    if tg_id != ADMIN_ID: return {"error": "Нет прав"}
+    
+    await delete_track(track_id)
+    return {"ok": True, "msg": "Трек отклонен и удален"}
+# ==========================================
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
