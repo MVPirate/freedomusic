@@ -292,17 +292,15 @@ h1, h2, h3 { margin: 0; font-weight: 700; }
   align-items: center;
   position: relative;
   overflow: hidden;
-  /* Убрали cursor: pointer отсюда, перенесли в track-main */
   transition: transform 0.1s ease, background 0.2s ease;
 }
 
-/* Новая зона для клика (обложка + текст) */
 .track-main {
   display: flex;
   align-items: center;
   gap: 15px;
   flex-grow: 1;
-  min-width: 0; /* Важно для работы многоточия в тексте */
+  min-width: 0;
   cursor: pointer;
   height: 100%;
 }
@@ -343,14 +341,13 @@ h1, h2, h3 { margin: 0; font-weight: 700; }
   align-items: center;
   gap: 4px;
 }
-/* Зона с кнопками и разделительная полоска */
 .track-actions {
   display: flex;
   flex-direction: row;
   align-items: center;
   gap: 4px;
   flex-shrink: 0;
-  border-left: 1px solid rgba(255, 255, 255, 0.1); /* Полоска */
+  border-left: 1px solid rgba(255, 255, 255, 0.1);
   padding-left: 10px;
   margin-left: 10px;
   position: relative;
@@ -1872,10 +1869,6 @@ body.full-player-open .bottom-nav { display: none; }
   margin-top: 4px;
 }
 
-/* ============================================ */
-/* --- НОВЫЕ СТИЛИ ДЛЯ ПЛЕЙЛИСТОВ И МАРКЕТА --- */
-/* ============================================ */
-
 .tactile-btn {
   transition: transform 0.1s cubic-bezier(0.4, 0, 0.2, 1),
               box-shadow 0.2s ease,
@@ -2115,7 +2108,6 @@ body[data-theme="light"] .new-settings-title { color: #111; }
 body[data-theme="light"] .new-settings-loop-title { color: #111; }
 body[data-theme="light"] .new-theme-name.light-text { color: #333; }
 
-/* --- СТИЛИ ДЛЯ НОВОЙ КНОПКИ "МОЯ ВОЛНА" --- */
 .new-wave-btn {
   background: linear-gradient(90deg, rgba(0, 210, 255, 0.15) 0%, rgba(0, 210, 255, 0.05) 100%);
   border: 1px solid rgba(0, 210, 255, 0.3);
@@ -2161,7 +2153,6 @@ body[data-theme="light"] .new-theme-name.light-text { color: #333; }
   justify-content: center;
   box-shadow: 0 0 15px var(--neon-blue-glow);
 }
-/* -------------------------------------------- */
 </style>
 </head>
 <body ontouchstart="">
@@ -3704,6 +3695,12 @@ function openActionModal(playlistId, title, isOnSale, isBought) {
   openBtn.onclick = () => { closeActionModal(); viewPlaylist(playlistId, title, 0); };
   btnContainer.appendChild(openBtn);
 
+  const offlineBtn = document.createElement('button');
+  offlineBtn.className = 'action-btn-modal';
+  offlineBtn.innerHTML = '📥 Создать оффлайн-тему (Premium)';
+  offlineBtn.onclick = () => createOfflinePlaylist(playlistId);
+  btnContainer.appendChild(offlineBtn);
+
   if (!isBought) {
     if (isOnSale) {
       const rmBtn = document.createElement('button');
@@ -4128,14 +4125,12 @@ function handleStartParam() {
 // ОБРАБОТКА КЛИКА ПО ТРЕКУ
 // ============================================
 function handleTrackClick(event, index, context) {
-    // Если клик был по кнопкам (лайк, три точки), ничего не делаем
     if (event.target.closest('.track-actions')) return;
     
-    // Воспроизводим трек в зависимости от контекста
     if (context === 'artist') {
         playFromArtist(index);
     } else {
-        playFromList(index); // Для search, likes, playlist
+        playFromList(index);
     }
 }
 
@@ -4146,60 +4141,114 @@ initLikes();
 fetchProfile();
 handleStartParam();
 loadTrending();
-
-// Функция загрузки списка треков на модерацию
+// ============================================
+// АДМИН-ПАНЕЛЬ: ДАШБОРД СТАТИСТИКИ
+// ============================================
 async function loadAdminPanel() {
     const container = document.getElementById('admin-track-list');
     if (!container) return; 
-    container.innerHTML = '<p style="text-align: center; color: gray;">Загрузка...</p>';
+    container.innerHTML = '<p style="text-align: center; color: gray;">Загрузка статистики...</p>';
+    
     try {
-        const res = await apiFetch('/api/admin/pending');
+        const res = await apiFetch('/api/admin/stats');
         const data = await res.json();
         
         if (data.error) throw new Error(data.error);
         
-        if (!data.tracks || data.tracks.length === 0) {
-            container.innerHTML = '<p style="text-align: center; color: gray;">🎉 Очередь пуста!</p>';
-            return;
-        }
+        let html = `
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 20px;">
+                <div style="background: #1c1c1e; padding: 15px; border-radius: 12px; text-align: center; border: 1px solid #333;">
+                    <div style="font-size: 28px; font-weight: bold; color: #007aff;">${data.dau}</div>
+                    <div style="font-size: 12px; color: #888;">Активных за 24ч</div>
+                </div>
+                <div style="background: #1c1c1e; padding: 15px; border-radius: 12px; text-align: center; border: 1px solid #333;">
+                    <div style="font-size: 28px; font-weight: bold; color: #ffb800;">${data.pending_tracks}</div>
+                    <div style="font-size: 12px; color: #888;">На модерации</div>
+                </div>
+                <div style="background: #1c1c1e; padding: 15px; border-radius: 12px; text-align: center; border: 1px solid #333;">
+                    <div style="font-size: 28px; font-weight: bold; color: #34c759;">${data.total_tracks}</div>
+                    <div style="font-size: 12px; color: #888;">Всего треков</div>
+                </div>
+                <div style="background: #1c1c1e; padding: 15px; border-radius: 12px; text-align: center; border: 1px solid #333;">
+                    <div style="font-size: 28px; font-weight: bold; color: #ff2d55;">${data.total_users}</div>
+                    <div style="font-size: 12px; color: #888;">Всего юзеров</div>
+                </div>
+            </div>
+            
+            <div style="display: flex; justify-content: space-between; align-items: center; background: #1c1c1e; padding: 15px; border-radius: 12px; margin-bottom: 20px; border: 1px solid #333;">
+                <div style="font-size: 14px; font-weight: bold; color: var(--gold);">⭐ Premium пользователей:</div>
+                <div style="font-size: 20px; font-weight: bold; color: var(--gold);">${data.premium_users}</div>
+            </div>
+
+            <h3 style="margin-bottom: 10px; font-size: 16px;">📊 Источники импорта</h3>
+            <div style="background: #1c1c1e; border-radius: 12px; padding: 15px; margin-bottom: 20px; border: 1px solid #333;">
+        `;
         
-        let html = '';
-        for (const track of data.tracks) {
+        const maxSource = Math.max(...data.sources.map(s => s.count), 1);
+        for (let s of data.sources) {
+            const percent = (s.count / maxSource) * 100;
             html += `
-                <div style="background: #1c1c1e; border-radius: 12px; padding: 15px; margin-bottom: 15px; border: 1px solid #333;">
-                    <h4 style="margin: 0 0 5px 0; color: #fff;">${track.artist} — ${track.title}</h4>
-                    <p style="margin: 0 0 10px 0; font-size: 12px; color: #888;">
-                        ID: ${track.id} | Источник: ${track.import_source || 'unknown'}
-                    </p>
-                    <div style="display: flex; gap: 10px;">
-                        <button onclick="moderateTrack(${track.id}, 'approve')" style="flex: 1; padding: 10px; background: #34c759; color: white; border: none; border-radius: 8px; font-weight: bold; cursor: pointer;">✅ Одобрить</button>
-                        <button onclick="moderateTrack(${track.id}, 'reject')" style="flex: 1; padding: 10px; background: #ff3b30; color: white; border: none; border-radius: 8px; font-weight: bold; cursor: pointer;">❌ Отклонить</button>
+                <div style="margin-bottom: 10px;">
+                    <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px;">
+                        <span style="text-transform: capitalize;">${s.source}</span>
+                        <span style="color: #888;">${s.count}</span>
+                    </div>
+                    <div style="height: 6px; background: #333; border-radius: 3px; overflow: hidden;">
+                        <div style="height: 100%; background: #007aff; width: ${percent}%;"></div>
                     </div>
                 </div>
             `;
         }
+        html += `</div>`;
+
+        html += `
+            <h3 style="margin-bottom: 10px; font-size: 16px;">🔥 Топ 5 треков</h3>
+            <div style="background: #1c1c1e; border-radius: 12px; padding: 15px; margin-bottom: 20px; border: 1px solid #333;">
+        `;
+        
+        if (data.top_tracks.length === 0) {
+            html += `<p style="text-align: center; color: #888; font-size: 13px;">Пока нет скачиваний</p>`;
+        } else {
+            data.top_tracks.forEach((t, i) => {
+                html += `
+                    <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px; ${i === data.top_tracks.length - 1 ? '' : 'border-bottom: 1px solid #333; padding-bottom: 8px;'}">
+                        <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 80%;">${i+1}. ${t.artist} — ${t.title}</span>
+                        <span style="color: #888; flex-shrink: 0;">⬇️ ${t.downloads}</span>
+                    </div>
+                `;
+            });
+        }
+        html += `</div>`;
+
+        // Кнопка перехода в бот для модерации
+        html += `
+            <button onclick="tg.openTelegramLink('https://t.me/my_freedom_music_bot')" style="width: 100%; padding: 15px; background: rgba(255,255,255,0.1); border: 1px solid #333; border-radius: 12px; color: white; font-weight: bold; cursor: pointer; display: flex; justify-content: center; align-items: center; gap: 8px; transition: 0.2s;">
+                🤖 Перейти в бот для модерации
+            </button>
+        `;
+
         container.innerHTML = html;
     } catch (e) {
-        container.innerHTML = `<p style="color: #ff3b30; text-align: center;">Ошибка: ${e.message}</p>`;
+        container.innerHTML = `<p style="color: #ff3b30; text-align: center;">Ошибка загрузки статистики: ${e.message}</p>`;
     }
 }
 
-// Функция одобрения/отклонения трека
-async function moderateTrack(trackId, action) {
+async function createOfflinePlaylist(playlistId) {
+    showToast("Создаю тему...");
     try {
-        const res = await apiFetch(`/api/admin/${action}/${trackId}`, { method: 'POST' });
+        const res = await apiFetch(`/api/offline/${playlistId}`, { method: 'POST' });
         const data = await res.json();
-        
-        if (data.ok) {
-            if (typeof showToast === 'function') showToast(data.msg || 'Успешно!'); 
-            loadAdminPanel(); 
+        if (data.error) {
+            showToast(data.error, true);
         } else {
-            if (typeof showToast === 'function') showToast(data.error || 'Ошибка при выполнении', true);
+            showToast("Тема создается! Зайдите в чат с ботом через минуту.");
+            closeActionModal();
         }
-    } catch (e) {
-        if (typeof showToast === 'function') showToast('Ошибка сети', true);
+    } catch(e) {
+        showToast("Ошибка сети", true);
     }
 }
+
 </script>
 </body>
 </html>

@@ -11,6 +11,7 @@ from html import escape as esc
 from pathlib import Path
 from typing import Any
 
+from backend.offline import offline_worker
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -1451,6 +1452,7 @@ async def main() -> None:
     ], scope=BotCommandScopeDefault())
     await bot.set_my_commands(commands=[BotCommand(command="admin", description="👑 Админ-панель"), BotCommand(command="moderate", description="⚙️ Модерация"), BotCommand(command="cache_all", description="🖼 Кеширование треков + обложки")], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     asyncio.create_task(download_worker())
+    asyncio.create_task(offline_worker(bot))
     log("Запуск бота...")
     await dp.start_polling(bot)
 

@@ -149,13 +149,74 @@ async def init_db() -> None:
                 INSERT INTO tracks_fts(tracks_fts, rowid, title, artist) VALUES('delete', old.id, old.title, old.artist);
                 INSERT INTO tracks_fts(rowid, title, artist) VALUES (new.id, new.title, new.artist);
             END;
+
+            -- ============================================================
+            -- ОФФЛАЙН-ПЛЕЙЛИСТЫ (ТЕМЫ В ЛС БОТА)
+            -- ============================================================
+            CREATE TABLE IF NOT EXISTS telegram_chats (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              kind TEXT NOT NULL DEFAULT 'dm',
+              tg_chat_id INTEGER NOT NULL,
+              invite_link TEXT,
+              state TEXT NOT NULL DEFAULT 'active',
+              grace_until TIMESTAMP,
+              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE (user_id, kind)
+            );
+
+            CREATE TABLE IF NOT EXISTS telegram_topics (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              chat_id INTEGER NOT NULL REFERENCES telegram_chats(id) ON DELETE CASCADE,
+              playlist_id INTEGER REFERENCES user_playlists(id) ON DELETE SET NULL,
+              thread_id INTEGER,
+              stale_thread_id INTEGER,
+              title TEXT NOT NULL,
+              state TEXT NOT NULL DEFAULT 'new',
+              rev INTEGER NOT NULL DEFAULT 1,
+              synced_rev INTEGER NOT NULL DEFAULT 0,
+              run_after TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              attempts INTEGER DEFAULT 0,
+              last_error TEXT,
+              last_synced_at TIMESTAMP,
+              UNIQUE (chat_id, playlist_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS telegram_topic_tracks (
+              topic_id INTEGER NOT NULL REFERENCES telegram_topics(id) ON DELETE CASCADE,
+              track_id INTEGER NOT NULL,
+              message_id INTEGER NOT NULL,
+              PRIMARY KEY (topic_id, track_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ttt_msg ON telegram_topic_tracks(topic_id, message_id);
+
+            CREATE TRIGGER IF NOT EXISTS trg_off_pt_ins AFTER INSERT ON playlist_tracks BEGIN
+              UPDATE telegram_topics SET rev = rev + 1, run_after = datetime('now','+30 seconds')
+              WHERE playlist_id = NEW.playlist_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_off_pt_del AFTER DELETE ON playlist_tracks BEGIN
+              UPDATE telegram_topics SET rev = rev + 1, run_after = datetime('now','+30 seconds')
+              WHERE playlist_id = OLD.playlist_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_off_pt_pos AFTER UPDATE OF position ON playlist_tracks BEGIN
+              UPDATE telegram_topics SET rev = rev + 1, run_after = datetime('now','+30 seconds')
+              WHERE playlist_id = NEW.playlist_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_off_track_status AFTER UPDATE OF status ON tracks
+            WHEN OLD.status <> NEW.status BEGIN
+              UPDATE telegram_topics SET rev = rev + 1, run_after = datetime('now','+30 seconds')
+              WHERE playlist_id IN (SELECT playlist_id FROM playlist_tracks WHERE track_id = NEW.id);
+            END;
             """
         )
-        
+
         await conn.execute("DELETE FROM playlist_tracks WHERE track_id NOT IN (SELECT id FROM tracks)")
         await conn.execute("DELETE FROM likes WHERE track_id NOT IN (SELECT id FROM tracks)")
         await conn.execute("INSERT INTO tracks_fts(tracks_fts) VALUES('rebuild')")
-        
+
         async with conn.execute("PRAGMA table_info(users)") as cursor:
             cols = [r[1] for r in await cursor.fetchall()]
             if "daily_download_limit" not in cols: await conn.execute("ALTER TABLE users ADD COLUMN daily_download_limit INTEGER DEFAULT 3")
@@ -165,7 +226,7 @@ async def init_db() -> None:
             if "active_theme" not in cols: await conn.execute("ALTER TABLE users ADD COLUMN active_theme TEXT DEFAULT 'dark'")
             if "unlocked_themes" not in cols: await conn.execute("ALTER TABLE users ADD COLUMN unlocked_themes TEXT DEFAULT '[\"dark\"]'")
             if "loop_playlist" not in cols: await conn.execute("ALTER TABLE users ADD COLUMN loop_playlist BOOLEAN DEFAULT 0")
-                
+
         async with conn.execute("PRAGMA table_info(tracks)") as cursor:
             cols = [r[1] for r in await cursor.fetchall()]
             if "original_duration" not in cols: await conn.execute("ALTER TABLE tracks ADD COLUMN original_duration INTEGER DEFAULT 0")
@@ -181,7 +242,7 @@ async def init_db() -> None:
         async with conn.execute("PRAGMA table_info(playlist_tracks)") as cursor:
             cols = [r[1] for r in await cursor.fetchall()]
             if "position" not in cols: await conn.execute("ALTER TABLE playlist_tracks ADD COLUMN position INTEGER DEFAULT 0")
-            
+
         async with conn.execute("PRAGMA table_info(user_playlists)") as cursor:
             cols = [r[1] for r in await cursor.fetchall()]
             if "price" not in cols: await conn.execute("ALTER TABLE user_playlists ADD COLUMN price INTEGER DEFAULT 0")
@@ -647,7 +708,7 @@ async def add_track_to_playlist(playlist_id: int, track_id: int, position: int =
 async def get_playlist_tracks(playlist_id: int) -> list[dict[str, Any]]:
     async with get_db() as conn:
         async with conn.execute(
-            """SELECT t.id, t.artist, t.title, t.quality_status 
+            """SELECT t.id, t.artist, t.title, t.quality_status, t.file_path, t.file_id
                FROM playlist_tracks pt 
                JOIN tracks t ON pt.track_id = t.id 
                WHERE pt.playlist_id = ? 
@@ -963,3 +1024,128 @@ async def get_wave_recommendations(user_id: int, limit: int = 20) -> list[dict[s
         
         random.shuffle(recommended_tracks)
         return recommended_tracks[:limit]
+
+async def get_admin_stats() -> dict:
+    async with get_db() as conn:
+        stats = {}
+        
+        # 1. Всего пользователей
+        async with conn.execute("SELECT COUNT(*) FROM users") as c:
+            stats["total_users"] = (await c.fetchone())[0]
+            
+        # 2. Треки в базе (approved)
+        async with conn.execute("SELECT COUNT(*) FROM tracks WHERE status = 'approved'") as c:
+            stats["total_tracks"] = (await c.fetchone())[0]
+            
+        # 3. Треки на модерации (pending)
+        async with conn.execute("SELECT COUNT(*) FROM tracks WHERE status = 'pending'") as c:
+            stats["pending_tracks"] = (await c.fetchone())[0]
+            
+        # 4. Пользователи за сутки (DAU)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        async with conn.execute("SELECT COUNT(*) FROM users WHERE last_download_date = ? OR created_at >= datetime('now', '-1 day')", (today,)) as c:
+            stats["dau"] = (await c.fetchone())[0]
+            
+        # 5. Популярные источники (import_source)
+        async with conn.execute("SELECT import_source, COUNT(*) as count FROM tracks GROUP BY import_source ORDER BY count DESC") as c:
+            stats["sources"] = [{"source": row[0] or "unknown", "count": row[1]} for row in await c.fetchall()]
+            
+        # 6. Премиум пользователи
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        async with conn.execute("SELECT COUNT(*) FROM users WHERE is_premium = 1 AND premium_expires_at > ?", (now_str,)) as c:
+            stats["premium_users"] = (await c.fetchone())[0]
+
+        # 7. Популярные треки (топ 5 по скачиваниям)
+        async with conn.execute("SELECT artist, title, download_count FROM tracks WHERE status = 'approved' ORDER BY download_count DESC LIMIT 5") as c:
+            stats["top_tracks"] = [{"artist": row[0], "title": row[1], "downloads": row[2]} for row in await c.fetchall()]
+
+        return stats
+
+# ============================================================
+# ФУНКЦИИ ДЛЯ ОФФЛАЙН-ПЛЕЙЛИСТОВ (ТЕМЫ В ЛС)
+# ============================================================
+async def get_or_create_telegram_chat(user_id: int, tg_chat_id: int) -> dict:
+    async with get_db() as conn:
+        async with conn.execute("SELECT * FROM telegram_chats WHERE user_id = ? AND kind = 'dm'", (user_id,)) as c:
+            row = await c.fetchone()
+            if row: return dict(row)
+        cursor = await conn.execute("INSERT INTO telegram_chats (user_id, kind, tg_chat_id) VALUES (?, 'dm', ?)", (user_id, tg_chat_id))
+        await conn.commit()
+        async with conn.execute("SELECT * FROM telegram_chats WHERE id = ?", (cursor.lastrowid,)) as c:
+            return dict(await c.fetchone())
+
+async def create_telegram_topic(chat_id: int, playlist_id: int, title: str) -> dict:
+    async with get_db() as conn:
+        cursor = await conn.execute(
+            "INSERT INTO telegram_topics (chat_id, playlist_id, title, state) VALUES (?, ?, ?, 'new')",
+            (chat_id, playlist_id, title)
+        )
+        await conn.commit()
+        async with conn.execute("SELECT * FROM telegram_topics WHERE id = ?", (cursor.lastrowid,)) as c:
+            return dict(await c.fetchone())
+
+async def get_topic(topic_id: int) -> dict | None:
+    async with get_db() as conn:
+        async with conn.execute("""
+            SELECT t.*, c.tg_chat_id 
+            FROM telegram_topics t 
+            JOIN telegram_chats c ON t.chat_id = c.id 
+            WHERE t.id = ?
+        """, (topic_id,)) as c:
+            row = await c.fetchone()
+            return dict(row) if row else None
+
+async def claim_topics(limit: int = 5) -> list[dict]:
+    async with get_db() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            async with conn.execute("""
+                SELECT t.id FROM telegram_topics t
+                JOIN telegram_chats c ON t.chat_id = c.id
+                WHERE t.state != 'syncing' AND t.run_after <= datetime('now') AND c.state = 'active'
+                AND (t.rev > t.synced_rev OR t.playlist_id IS NULL)
+                LIMIT ?
+            """, (limit,)) as c:
+                rows = await c.fetchall()
+            
+            if not rows:
+                await conn.commit()
+                return []
+                
+            topic_ids = [r["id"] for r in rows]
+            placeholders = ','.join('?' for _ in topic_ids)
+            await conn.execute(f"UPDATE telegram_topics SET state = 'syncing' WHERE id IN ({placeholders})", topic_ids)
+            await conn.commit()
+            
+            async with conn.execute(f"SELECT * FROM telegram_topics WHERE id IN ({placeholders})", topic_ids) as c:
+                return [dict(row) for row in await c.fetchall()]
+        except Exception:
+            await conn.rollback()
+            raise
+
+async def finish_topic(topic_id: int, synced_rev: int):
+    async with get_db() as conn:
+        await conn.execute("UPDATE telegram_topics SET state = 'ready', synced_rev = ?, last_synced_at = CURRENT_TIMESTAMP WHERE id = ?", (synced_rev, topic_id))
+        await conn.commit()
+
+async def set_topic_thread_id(topic_id: int, thread_id: int):
+    async with get_db() as conn:
+        await conn.execute("UPDATE telegram_topics SET thread_id = ? WHERE id = ?", (thread_id, topic_id))
+        await conn.commit()
+
+async def add_topic_track(topic_id: int, track_id: int, message_id: int):
+    async with get_db() as conn:
+        await conn.execute("INSERT OR REPLACE INTO telegram_topic_tracks (topic_id, track_id, message_id) VALUES (?, ?, ?)", (topic_id, track_id, message_id))
+        await conn.commit()
+
+async def get_topic_tracks(topic_id: int) -> list[dict]:
+    async with get_db() as conn:
+        async with conn.execute("SELECT * FROM telegram_topic_tracks WHERE topic_id = ? ORDER BY message_id ASC", (topic_id,)) as c:
+            return [dict(row) for row in await c.fetchall()]
+
+async def drop_topic_tracks(topic_id: int, track_ids: list[int]):
+    if not track_ids: return
+    async with get_db() as conn:
+        placeholders = ','.join('?' for _ in track_ids)
+        await conn.execute(f"DELETE FROM telegram_topic_tracks WHERE topic_id = ? AND track_id IN ({placeholders})", [topic_id] + track_ids)
+        await conn.commit()

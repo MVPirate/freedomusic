@@ -10,16 +10,30 @@ import hmac
 import hashlib
 import time
 
+# --- НОВЫЕ ИМПОРТЫ ДЛЯ АДМИН-ПРЕВЬЮ ---
+import subprocess
+import asyncio
+import os
+# --------------------------------------
+
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import FSInputFile, LabeledPrice
 from aiogram.utils.web_app import safe_parse_webapp_init_data
 
-from backend.config import TELEGRAM_BOT_TOKEN, ADMIN_ID, STREAM_SECRET_KEY
+from dotenv import load_dotenv
+
+# Загружаем переменные из .env
+load_dotenv()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+STREAM_SECRET_KEY = os.getenv("STREAM_SECRET_KEY", "super_secret_fallback_key") 
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+
 from backend.database import (
-    get_user, claim_daily, search_tracks, check_download_limit, 
-    increment_download_count, get_track_by_id, increment_track_download, 
+    get_user, claim_daily, search_tracks, check_download_limit,
+    increment_download_count, get_track_by_id, increment_track_download,
     add_points, get_user_by_internal_id, delete_track,
     create_user_playlist, get_user_playlists, add_track_to_playlist, get_playlist_tracks,
     get_level_progress, set_playlist_price, get_market_playlists, buy_playlist,
@@ -30,8 +44,15 @@ from backend.database import (
     get_trending_artists, get_tracks_by_artist, set_track_file_id,
     update_user_settings, buy_theme,
     get_wave_recommendations,
-    is_premium_active,get_pending_tracks, update_track_status, delete_track
+    is_premium_active, get_pending_tracks, update_track_status, delete_track, get_admin_stats,
+    get_or_create_telegram_chat, create_telegram_topic 
 )
+
+# --- НОВЫЙ ИМПОРТ ДЛЯ FFMPEG/SOUNDCLOUD ---
+from backend.downloader import (
+    fix_audio_tags, FFMPEG_PATH, find_soundcloud_link
+)
+# -----------------------------------------
 
 logger = logging.getLogger(__name__)
 
@@ -656,6 +677,103 @@ async def api_admin_reject(track_id: int, request: Request):
     
     await delete_track(track_id)
     return {"ok": True, "msg": "Трек отклонен и удален"}
+
+
+@app.get("/api/admin/stats")
+async def api_admin_stats(request: Request):
+    tg_id = await get_tg_user_id(request)
+    if tg_id != ADMIN_ID: return {"error": "Нет прав"}
+    
+    stats = await get_admin_stats()
+    return stats
+
+
+# ==========================================
+# АДМИН-ПАНЕЛЬ: ПРЕВЬЮ, ПОЛНЫЙ ТРЕК И SOUNDCLOUD
+# ==========================================
+
+@app.get("/api/admin/preview/{track_id}")
+async def api_admin_preview(track_id: int, request: Request):
+    tg_id = await get_tg_user_id(request)
+    if tg_id != ADMIN_ID: raise HTTPException(403, "Нет прав")
+    
+    track = await get_track_by_id(track_id)
+    if not track or not track["file_path"]: raise HTTPException(404, "Файл не найден")
+    
+    file_path = Path(track["file_path"])
+    if not file_path.exists(): raise HTTPException(404, "Файл физически отсутствует")
+    
+    duration = track["duration"]
+    if duration < 30:
+        return FileResponse(file_path, media_type="audio/mpeg")
+        
+    preview_path = file_path.with_name(f"preview_{file_path.name}")
+    if preview_path.exists():
+        return FileResponse(preview_path, media_type="audio/mpeg")
+        
+    # Генерируем превью на лету
+    mid_start, mid_end, end_start = (duration // 2) - 5, (duration // 2) + 5, duration - 10
+    cmd = [
+        str(FFMPEG_PATH), "-y", "-i", str(file_path),
+        "-filter_complex",
+        f"[0:a]atrim=start=0:end=10,asetpts=PTS-STARTPTS[a1]; [0:a]atrim=start={mid_start}:end={mid_end},asetpts=PTS-STARTPTS[a2]; [0:a]atrim=start={end_start}:end={duration},asetpts=PTS-STARTPTS[a3]; [a1][a2][a3]concat=n=3:v=0:a=1[outa]",
+        "-map", "[outa]", "-c:a", "libmp3lame", str(preview_path)
+    ]
+    
+    try:
+        await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
+        if preview_path.exists():
+            return FileResponse(preview_path, media_type="audio/mpeg")
+        return FileResponse(file_path, media_type="audio/mpeg")
+    except Exception:
+        return FileResponse(file_path, media_type="audio/mpeg")
+
+@app.get("/api/admin/full/{track_id}")
+async def api_admin_full(track_id: int, request: Request):
+    tg_id = await get_tg_user_id(request)
+    if tg_id != ADMIN_ID: raise HTTPException(403, "Нет прав")
+    
+    track = await get_track_by_id(track_id)
+    if not track or not track["file_path"]: raise HTTPException(404, "Файл не найден")
+    
+    file_path = Path(track["file_path"])
+    if not file_path.exists(): raise HTTPException(404, "Файл отсутствует")
+    return FileResponse(file_path, media_type="audio/mpeg")
+
+@app.post("/api/admin/soundcloud/{track_id}")
+async def api_admin_soundcloud(track_id: int, request: Request):
+    tg_id = await get_tg_user_id(request)
+    if tg_id != ADMIN_ID: return {"error": "Нет прав"}
+    
+    track = await get_track_by_id(track_id)
+    if not track: return {"error": "Трек не найден"}
+    
+    query = f"{track['artist']} - {track['title']}"
+    link = await asyncio.to_thread(find_soundcloud_link, query)
+    
+    if link:
+        return {"ok": True, "link": link}
+    return {"error": "Не удалось найти трек на SoundCloud"}
+
+@app.post("/api/offline/{playlist_id}")
+async def api_create_offline_playlist(playlist_id: int, request: Request):
+    tg_id = await get_tg_user_id(request)
+    if not tg_id: return {"error": "Нет данных от Telegram"}
+    
+    user = await get_user(tg_id)
+    if not user: return {"error": "Пользователь не найден"}
+    
+    if not is_premium_active(user):
+        return {"error": "Оффлайн-плейлисты доступны только с Premium!"}
+        
+    playlist = await get_playlist_by_id(playlist_id)
+    if not playlist or playlist["user_id"] != user["id"]:
+        return {"error": "Плейлист не найден"}
+        
+    chat = await get_or_create_telegram_chat(int(user["id"]), tg_id)
+    await create_telegram_topic(chat["id"], playlist_id, playlist["title"])
+    
+    return {"ok": True, "msg": "Тема создается! Зайдите в чат с ботом через минуту."}
 # ==========================================
 
 if __name__ == "__main__":
