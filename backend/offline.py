@@ -2,7 +2,6 @@ import asyncio
 import time
 from collections import defaultdict
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import FSInputFile
 
 from backend.database import (
     claim_topics, get_topic, finish_topic, set_topic_thread_id,
@@ -65,23 +64,50 @@ async def create_topic(bot, chat_id: int, title: str, seed: int = 0) -> int:
     ))
     return t.message_thread_id
 
+import os
+from mutagen.id3 import ID3
+from aiogram.types import FSInputFile, BufferedInputFile
+
 async def send_track(bot, chat_id: int, thread_id: int | None, tr: dict) -> int:
-    async def _send(audio):
+    # Функция для извлечения обложки из MP3 на лету
+    def get_cover_bytes(file_path: str):
+        try:
+            if not os.path.exists(file_path):
+                return None
+            tags = ID3(file_path)
+            for tag in tags.values():
+                if tag.FrameID == 'APIC': # Это ID3-тег обложки
+                    return tag.data
+        except Exception as e:
+            print(f"[Offline] Ошибка чтения обложки: {e}")
+        return None
+
+    async def _send(audio, thumb=None):
+        # Если обложка есть, оборачиваем её в BufferedInputFile
+        thumbnail = BufferedInputFile(thumb, filename="cover.jpg") if thumb else None
+        
         return await pacer.call(chat_id, lambda: bot.send_audio(
-            chat_id=chat_id, message_thread_id=thread_id, audio=audio,
-            title=tr["title"], performer=tr["artist"], disable_notification=True
+            chat_id=chat_id, 
+            message_thread_id=thread_id, 
+            audio=audio,
+            thumbnail=thumbnail, # Передаем обложку
+            title=tr["title"], 
+            performer=tr["artist"], 
+            disable_notification=True
         ))
+
+    # 1. Проверяем, есть ли закешированный file_id
+    if tr.get("file_id"):
+        msg = await _send(tr["file_id"]) 
+    else:
+        # 2. Если нет — берем файл с диска и вытаскиваем обложку
+        thumb_data = get_cover_bytes(tr["file_path"]) if tr.get("file_path") else None
+        msg = await _send(FSInputFile(tr["file_path"]), thumb=thumb_data)
         
-    uploaded = not tr.get("file_id")
-    try:
-        msg = await _send(tr["file_id"] or FSInputFile(tr["file_path"]))
-    except TelegramBadRequest as e:
-        if "thread not found" in str(e).lower():
-            raise TopicGone
-        raise
-        
-    if uploaded:
-        await set_track_file_id(tr["id"], msg.audio.file_id)
+        # 3. Сохраняем file_id в базу, чтобы в следующий раз отправить мгновенно
+        if msg.audio:
+            await set_track_file_id(tr["id"], msg.audio.file_id)
+            
     return msg.message_id
 
 async def sync_topic(bot, topic_id: int):
