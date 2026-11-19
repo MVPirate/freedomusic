@@ -32,6 +32,7 @@ STREAM_SECRET_KEY = os.getenv("STREAM_SECRET_KEY", "super_secret_fallback_key")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 from backend.database import (
+    get_db,
     get_user, claim_daily, search_tracks, check_download_limit,
     increment_download_count, get_track_by_id, increment_track_download,
     add_points, get_user_by_internal_id, delete_track,
@@ -755,6 +756,56 @@ async def api_admin_soundcloud(track_id: int, request: Request):
         return {"ok": True, "link": link}
     return {"error": "Не удалось найти трек на SoundCloud"}
 
+@app.post("/api/offline/liked")
+async def api_create_offline_liked(request: Request):
+    tg_id = await get_tg_user_id(request)
+    if not tg_id: return {"error": "Нет данных от Telegram"}
+    
+    user = await get_user(tg_id)
+    if not user: return {"error": "Пользователь не найден"}
+    
+    if not is_premium_active(user):
+        return {"error": "Оффлайн-плейлисты доступны только с Premium!"}
+
+    # Проверяем, есть ли уже скрытый плейлист для лайков у этого пользователя
+    # Ищем плейлист с названием "❤️ Мне нравится" (можно добавить специальный флаг, если нужно)
+    system_playlist_title = "❤️ Мне нравится"
+    
+    async with get_db() as conn:
+        # Ищем существующий плейлист
+        async with conn.execute(
+            "SELECT id FROM user_playlists WHERE user_id = ? AND title = ?", 
+            (int(user["id"]), system_playlist_title)
+        ) as c:
+            row = await c.fetchone()
+            
+        if row:
+            playlist_id = row["id"]
+        else:
+            # Создаем скрытый плейлист, если его нет
+            cursor = await conn.execute(
+                "INSERT INTO user_playlists (user_id, title, is_public, price) VALUES (?, ?, 0, 0)",
+                (int(user["id"]), system_playlist_title)
+            )
+            playlist_id = cursor.lastrowid
+            await conn.commit()
+
+        # Копируем все лайки пользователя в этот плейлист
+        # (удаляем старые копии, если они были, чтобы не было дублей)
+        await conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,))
+        await conn.execute(
+            """INSERT INTO playlist_tracks (playlist_id, track_id, position)
+               SELECT ?, track_id, position FROM likes WHERE user_id = ? ORDER BY position ASC""",
+            (playlist_id, int(user["id"]))
+        )
+        await conn.commit()
+
+    # Отправляем заявку воркеру на создание оффлайн-темы
+    chat = await get_or_create_telegram_chat(int(user["id"]), tg_id)
+    await create_telegram_topic(chat["id"], playlist_id, system_playlist_title)
+    
+    return {"ok": True, "msg": "Тема для Лайков создается! Зайдите в чат с ботом через минуту."}
+
 @app.post("/api/offline/{playlist_id}")
 async def api_create_offline_playlist(playlist_id: int, request: Request):
     tg_id = await get_tg_user_id(request)
@@ -775,6 +826,8 @@ async def api_create_offline_playlist(playlist_id: int, request: Request):
     
     return {"ok": True, "msg": "Тема создается! Зайдите в чат с ботом через минуту."}
 # ==========================================
+
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

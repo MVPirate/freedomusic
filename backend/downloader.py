@@ -261,32 +261,29 @@ async def download_track_from_youtube(artist: str, title: str, duration: int = 0
 # Яндекс используется ТОЛЬКО для метаданных плейлиста (artist, title, duration, yandex_id).
 # Аудио оттуда не качаем: Яндекс отдаёт цензурированные версии.
 async def download_track_smart(track: dict) -> tuple[str | None, str | None, str | None]:
-    """track = {'artist', 'title', 'duration'?, ...}  ->  (file_path | None, err | None, source_url | None).
-
-    Лишние ключи (например 'yandex_id') игнорируются. duration (сек, из Яндекса) нужна для сверки
-    длины файла: так отсеиваются замедленные/ускоренные версии.
-    """
+    """track = {'artist', 'title', 'duration'?, ...}  ->  (file_path | None, err | None, source_url | None)."""
     artist = track.get('artist') or ''
     title = track.get('title') or ''
     duration = int(track.get('duration') or 0)
     last_err = None
 
-    # 1. Hitmo — основной источник
+    # 1. SoundCloud — ОСНОВНОЙ источник (там 99% без цензуры)
+    path, err, src = await download_track_from_youtube(artist, title, duration)
+    if path:
+        return path, None, src
+    last_err = err
+    logger.info(f"SoundCloud не дал файл ({err}) для {artist} - {title}, пробую Hitmo")
+
+    # 2. Hitmo — ЗАПАСНОЙ (через прокси, если SoundCloud не смог)
     try:
         path, err, src = await download_from_hitmo(artist, title, UPLOADS_DIR, duration)
         if path:
             ensure_track_has_cover(path, artist, title)
             return path, None, src
-        last_err = err
-        logger.info(f"Hitmo не дал файл ({err}) для {artist} - {title}, пробую SoundCloud")
+        last_err = err or last_err
     except Exception as e:
         logger.error(f"Hitmo упал на {artist} - {title}: {e}")
-        last_err = "error"
 
-    # 2. SoundCloud — запасной (curl_cffi, перебор кандидатов, фолбэк по исполнителю)
-    path, err, src = await download_track_from_youtube(artist, title, duration)
-    if path:
-        return path, None, src
     return None, (err or last_err or "not_found"), None
 
 

@@ -3565,8 +3565,10 @@ async function loadPlaylists() {
     if (likesData.tracks) likesCount = likesData.tracks.length;
   } catch(e) {}
 
+  // ДОБАВЛЕНА КНОПКА МЕНЮ (new-playlist-card-menu) ДЛЯ ПЛЕЙЛИСТА "МНЕ НРАВИТСЯ"
   let html = `
     <div class="glass-panel new-playlist-card tactile-btn fade-in-item" onclick="viewLikedTracks()" style="position: relative;">
+      <div class="new-playlist-card-menu" onclick="event.stopPropagation(); openActionModal('liked', 'Мне нравится', false, false)">⋮</div>
       <div class="new-playlist-card-cover-wrap" style="background: linear-gradient(135deg, #ff0844, #ffb199); display: flex; justify-content: center; align-items: center;">
         <span style="font-size: 60px;">❤️</span>
         <div class="new-playlist-card-play"><span style="color: black; font-size: 12px; margin-left: 2px;">▶</span></div>
@@ -4243,6 +4245,27 @@ async function createOfflinePlaylist(playlistId) {
         } else {
             showToast("Тема создается! Зайдите в чат с ботом через минуту.");
             closeActionModal();
+        }
+    } catch(e) {
+        showToast("Ошибка сети", true);
+    }
+}
+
+
+// МЕНЮ ДЛЯ ПЛЕЙЛИСТА "МНЕ НРАВИТСЯ" 
+// Запрос на создание оффлайн-темы для лайков
+async function createOfflineLikedPlaylist() {
+    closeActionModal();
+    showToast("Отправляю запрос на создание темы...");
+    try {
+        // Обращаемся к новому эндпоинту (напишем его на бэкенде позже)
+        const res = await apiFetch('/api/offline/liked', { method: 'POST' });
+        const data = await res.json();
+        
+        if (data.error) {
+            showToast(data.error, true);
+        } else {
+            showToast("Тема создается! Зайдите в чат с ботом через минуту.");
         }
     } catch(e) {
         showToast("Ошибка сети", true);
