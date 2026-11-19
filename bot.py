@@ -45,7 +45,7 @@ from backend.database import (
 from backend.parser import detect_source, parse_playlist, get_yandex_client, parse_single_track
 from backend.downloader import (
     download_track_from_youtube, fix_audio_tags, FFMPEG_PATH, find_soundcloud_link,
-    download_from_soundcloud_url, ensure_track_has_cover, download_track_from_direct_url
+    download_from_soundcloud_url, ensure_track_has_cover, download_track_from_direct_url,download_track_smart 
 )
 from backend.hitmo_parser import download_from_hitmo, parse_artist_page_hitmo
 
@@ -298,16 +298,20 @@ async def process_task(task_data):
         elif skip_soundcloud:
             file_path, err_type, source_url = None, "skipped_sc", None
         else:
-            file_path, err_type, source_url = await download_track_from_youtube(artist, title)
-
-        if not file_path:
-            log(f"Пробую Hitmo для: {artist} - {title}")
-            file_path, err_type, source_url = await download_from_hitmo(artist, title, UPLOADS_DIR)
+            # --- НОВАЯ ЛОГИКА ОТ КЛОДА: Hitmo -> SoundCloud ---
+            smart_task = {
+                "artist": artist,
+                "title": title,
+                "duration": orig_dur,  # Передаем длительность из Яндекса для отсева slowed/sped up
+            }
+            file_path, err_type, source_url = await download_track_smart(smart_task)
+            # --------------------------------------------------
 
         if file_path:
             await asyncio.to_thread(ensure_track_has_cover, str(file_path), artist, title)
             await asyncio.to_thread(fix_audio_tags, file_path, artist, title)
             bitrate, duration = await asyncio.to_thread(get_audio_info, Path(file_path))
+            
             if duration < 60:
                 Path(file_path).unlink()
                 await safe_send(tg_id, f"❌ Пропущено (слишком короткий трек): {esc(title)}")
@@ -326,12 +330,11 @@ async def process_task(task_data):
                 )
                 await safe_send(tg_id, f"✅ Скачано: {esc(title)}")
                 await add_points(user_id, 5, "import_track")
-                # Лимит уже зарезервирован через reserve_downloads — здесь НЕ увеличиваем
 
-                duration_diff = abs(duration - orig_dur) if orig_dur > 0 else 0
-
-                if tg_id == ADMIN_ID and duration_diff <= 15:
-                    await update_track_status(new_track["id"], "approved", user_id)
+                # АВТО-МОДЕРАЦИЯ ОТКЛЮЧЕНА (Теперь всё падает в ручную модерацию)
+                # duration_diff = abs(duration - orig_dur) if orig_dur > 0 else 0
+                # if tg_id == ADMIN_ID and duration_diff <= 15:
+                #     await update_track_status(new_track["id"], "approved", user_id)
 
                 if task_data.get('add_to_liked') and new_track:
                     pos = task_data.get('pending_position', 0)
@@ -348,8 +351,8 @@ async def process_task(task_data):
                 pending_playlist_id=pending_playlist_id,
                 pending_position=pending_position
             )
-            # Трек не скачался → возвращаем зарезервированный лимит
             await refund_downloads(user_id, 1)
+            
     except ValueError:
         await safe_send(tg_id, f"⏩ Пропущено (дубликат): {esc(title)}")
         await refund_downloads(user_id, 1)
@@ -1382,6 +1385,8 @@ async def handle_text(message: Message) -> None:
             
             try:
                 file_path, err, src_url = await download_from_soundcloud_url(url, track["artist"], track["title"])
+                if file_path and Path(file_path).exists() and Path(file_path).stat().st_size > 50_000:
+                    await asyncio.to_thread(ensure_track_has_cover, file_path, track["artist"], track["title"])
                 
                 if file_path and Path(file_path).exists() and Path(file_path).stat().st_size > 50_000:
                     br, dur = await asyncio.to_thread(get_audio_info, Path(file_path))

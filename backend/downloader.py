@@ -8,17 +8,40 @@ from pathlib import Path
 import logging
 import uuid
 import re
-import difflib
+
+# Общие функции очистки/сравнения названий, проверки версий и длительности живут в hitmo_parser.py
+try:
+    from .hitmo_parser import (
+        split_artists, clean_title, build_search_queries, match_track, norm, download_from_hitmo,
+        duration_ok, mp3_length, has_bad_marker, BAD_WORDS,
+    )
+except ImportError:  # модуль запущен не как пакет (backend/ добавлен в sys.path)
+    from hitmo_parser import (
+        split_artists, clean_title, build_search_queries, match_track, norm, download_from_hitmo,
+        duration_ok, mp3_length, has_bad_marker, BAD_WORDS,
+    )
 
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOADS_DIR = BASE_DIR / "uploads"
-FFMPEG_PATH = "ffmpeg"
+FFMPEG_PATH = "/usr/bin/ffmpeg"
 TRUSTED_FILE = Path(__file__).resolve().parent / "trusted_artists.json"
 PROXIES_FILE = Path(__file__).resolve().parent / "proxies.txt"
 
-BAD_WORDS = ['8d', '8 d', '8-d', '8d audio', 'echo', 'эхо', 'cover', 'instrumental', 'минус', 'кавер']
+SC_MAX_DOWNLOAD_ATTEMPTS = 4   # сколько кандидатов максимум пробуем скачать на один трек
+SC_MAX_QUERIES = 4             # сколько вариантов поискового запроса максимум
+
+# SoundCloud в свежих yt-dlp ходит через имперсонацию браузера (curl_cffi). Без неё на VPS
+# страница артиста/поиск может вернуть пусто/403 — а локально (yt-dlp[default] + curl_cffi) всё работало.
+try:
+    import curl_cffi  # noqa: F401
+except ImportError:
+    logger.warning(
+        "curl_cffi не установлен: SoundCloud может отдавать пустой результат/403. "
+        "Установи: pip install -U \"yt-dlp[default,curl-cffi]\" и перезапусти бота."
+    )
+
 
 def _load_proxies() -> list[str]:
     """Загружает список прокси из backend/proxies.txt (построчно)."""
@@ -50,90 +73,222 @@ def _get_ydl_opts(base_path: Path):
         ],
     }
 
-def _sync_download(artist: str, title: str, filename: str) -> tuple[str | None, str | None, str | None]:
+
+# ============================================================
+# ТЕГИ И ОБЛОЖКИ (общие хелперы)
+# ============================================================
+def _ensure_id3(file_path: str) -> None:
+    """Если у mp3 нет ID3-заголовка (сырые файлы Яндекса/Hitmo) — создаём пустой."""
+    from mutagen.id3 import ID3, ID3NoHeaderError
+    try:
+        ID3(file_path)
+    except ID3NoHeaderError:
+        ID3().save(file_path)
+
+def _has_cover(file_path: str) -> bool:
+    try:
+        from mutagen.id3 import ID3
+        return bool(ID3(file_path).getall('APIC'))
+    except Exception:
+        return False
+
+def _embed_cover_bytes(file_path: str, raw: bytes) -> bool:
+    """Любую картинку -> JPEG <=320px (лимиты Telegram) -> APIC в mp3."""
+    try:
+        from PIL import Image
+        from io import BytesIO
+        from mutagen.id3 import ID3, APIC
+        img = Image.open(BytesIO(raw)).convert("RGB")
+        img.thumbnail((320, 320))
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=85)
+        _ensure_id3(file_path)
+        tags = ID3(file_path)
+        tags.delall('APIC')
+        tags.add(APIC(encoding=3, mime='image/jpeg', type=3, desc='Cover', data=out.getvalue()))
+        tags.save(file_path)
+        return True
+    except Exception as e:
+        logger.error(f"Не удалось вшить обложку в {file_path}: {e}")
+        return False
+
+
+# ============================================================
+# SOUNDCLOUD (запасной источник)
+# ============================================================
+def _sc_candidate_ok(entry: dict, artist: str, title: str, duration: int, check_artist: bool = True) -> bool:
+    url = entry.get('url')
+    etitle = entry.get('title') or ''
+    if not url or not etitle:
+        return False
+    if has_bad_marker(etitle, title):
+        return False  # slowed / 8D / remix / live / cover ... (если этого нет в самом запросе)
+    dur = entry.get('duration') or 0
+    if dur and dur < 60:
+        return False  # 30-секундные Go+ превью и обрывки
+    if duration and dur and not duration_ok(dur, duration):
+        return False  # замедленные/ускоренные/удлинённые версии
+    signature = f"{entry.get('uploader') or ''} - {etitle}"
+    return match_track(signature, artist if check_artist else "", title)
+
+def _sc_search(query: str, limit: int = 10) -> list[dict]:
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
+            result = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
+        return [e for e in ((result or {}).get('entries') or []) if e]
+    except Exception as e:
+        logger.error(f"Ошибка поиска SoundCloud по '{query}': {e}")
+        return []
+
+def _sc_list_page(page_url: str) -> list[dict]:
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
+            result = ydl.extract_info(page_url, download=False)
+        return [e for e in ((result or {}).get('entries') or []) if e]
+    except Exception as e:
+        logger.error(f"Ошибка чтения страницы {page_url}: {e}")
+        return []
+
+def _sc_webpage_url(url: str) -> str | None:
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl_meta:
+            info = ydl_meta.extract_info(url, download=False, process=False)
+            if info:
+                return info.get('webpage_url') or info.get('permalink_url')
+    except Exception:
+        pass
+    return None
+
+def _sc_download(url: str, ydl_opts: dict, base_path: Path) -> str | None:
+    proxy_list = _load_proxies()
+    opts = dict(ydl_opts)
+    if proxy_list:
+        opts['proxy'] = random.choice(proxy_list)
+        logger.info(f"Использую прокси: {opts['proxy']}")
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        mp3_path = base_path.with_suffix('.mp3')
+        if mp3_path.exists():
+            return str(mp3_path)
+    except Exception as e:
+        if "DRM" in str(e):
+            logger.info(f"SoundCloud: трек защищён DRM, беру следующего кандидата ({url})")
+        else:
+            logger.warning(f"SoundCloud: не удалось скачать {url}: {e}")
+    return None
+
+def _sync_download(artist: str, title: str, filename: str, duration: int = 0) -> tuple[str | None, str | None, str | None]:
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     base_path = UPLOADS_DIR / filename
     ydl_opts = _get_ydl_opts(base_path)
-    
-    clean_req_title = re.sub(r'[^\w\s]', '', title.lower()).strip()
 
-    # --- ПРОВЕРКА БЕЛОГО СПИСКА ---
+    tried: set[str] = set()
+    attempts = 0
+
+    def try_entries(entries: list[dict], check_artist: bool = True):
+        """Перебирает кандидатов: фильтр -> скачивание; DRM/ошибка -> следующий."""
+        nonlocal attempts
+        for entry in entries:
+            if attempts >= SC_MAX_DOWNLOAD_ATTEMPTS:
+                return None
+            url = entry.get('url')
+            if url in tried or not _sc_candidate_ok(entry, artist, title, duration, check_artist):
+                continue
+            tried.add(url)
+            attempts += 1
+            webpage_url = _sc_webpage_url(url)
+            path = _sc_download(url, ydl_opts, base_path)
+            if path:
+                real = mp3_length(path)
+                if duration and not duration_ok(real, duration):
+                    logger.warning(f"SoundCloud: длительность не совпала ({real:.0f}с вместо ~{duration}с), беру следующего: {url}")
+                    Path(path).unlink(missing_ok=True)
+                    continue
+                return path, None, (webpage_url or url)
+        return None
+
+    # --- ПРОВЕРКА БЕЛОГО СПИСКА (по полной строке артистов и по каждому артисту отдельно) ---
     artist_url = None
     if TRUSTED_FILE.exists():
         try:
             # utf-8-sig — чтобы не спотыкаться на BOM (PowerShell, Блокнот и т.п.)
             with open(TRUSTED_FILE, 'r', encoding='utf-8-sig') as f:
-                trusted = json.load(f)
-                if artist in trusted:
-                    artist_url = trusted[artist]
-                    logger.info(f"⭐ {artist} в белом списке. Ищу на официальной странице.")
+                trusted = {k.lower(): v for k, v in json.load(f).items()}
+            for name in [artist] + split_artists(artist):
+                if name.lower() in trusted:
+                    artist_url = trusted[name.lower()]
+                    logger.info(f"⭐ {name} в белом списке. Ищу на официальной странице.")
+                    break
         except Exception as e:
             logger.error(f"Ошибка чтения белого списка: {e}")
 
-    # Вспомогательная функция для поиска (чтобы не дублировать код)
-    def try_search(query_url: str) -> tuple[str | None, str | None, str | None]:
-        try:
-            with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
-                result = ydl.extract_info(query_url, download=False)
-                entries = result.get('entries', [])
-                
-            for entry in entries:
-                entry_title = entry.get('title', '')
-                entry_title_lower = entry_title.lower()
-                url = entry.get('url')
-                duration = entry.get('duration', 0)
-                
-                if not url or (duration and duration < 60): continue
-                if any(bad_word in entry_title_lower for bad_word in BAD_WORDS): continue
-
-                clean_entry_title = re.sub(r'[^\w\s]', '', entry_title_lower).strip()
-                if clean_req_title not in clean_entry_title and clean_entry_title not in clean_req_title:
-                    ratio = difflib.SequenceMatcher(None, clean_req_title, clean_entry_title).ratio()
-                    if ratio < 0.65: continue
-                
-                webpage_url = None
-                try:
-                    with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl_meta:
-                        info = ydl_meta.extract_info(url, download=False, process=False)
-                        if info: webpage_url = info.get('webpage_url') or info.get('permalink_url')
-                except Exception: pass
-
-                final_source_url = webpage_url or url
-
-                try:
-                    # Загружаем прокси из файла (если он есть)
-                    proxy_list = _load_proxies()
-
-                    # Если прокси есть, выбираем случайный и передаем в yt-dlp
-                    current_proxy = random.choice(proxy_list) if proxy_list else None
-                    if current_proxy:
-                        ydl_opts['proxy'] = current_proxy
-                        logger.info(f"Использую прокси: {current_proxy}")
-
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([url])
-                    mp3_path = base_path.with_suffix('.mp3')
-                    if mp3_path.exists():
-                        return str(mp3_path), None, final_source_url
-                except Exception as e:
-                    if "DRM" in str(e): continue
-        except Exception as e:
-            logger.error(f"Ошибка поиска по {query_url}: {e}")
-        return None, "error", None
-
-    # 1. Пытаемся искать на странице артиста (если он в белом списке)
+    # 1. Официальная страница артиста — артиста внутри не проверяем, он и так «свой»
     if artist_url:
-        file_path, err, src_url = try_search(f"{artist_url}/tracks")
-        if file_path:
-            return file_path, err, src_url
+        found = try_entries(_sc_list_page(f"{artist_url}/tracks"), check_artist=False)
+        if found:
+            return found
         logger.info(f"На странице {artist} ничего не нашли или DRM. Переключаюсь на общий поиск...")
 
-    # 2. Фолбэк: Обычный поиск по SoundCloud
-    return try_search(f"scsearch10:{artist} - {title} audio")
+    # 2. Общий поиск: несколько вариантов запроса (главный артист + чистое название, все артисты, первые слова, ...)
+    for query in build_search_queries(artist, title, limit=SC_MAX_QUERIES):
+        found = try_entries(_sc_search(query, 10))
+        if found:
+            return found
+        if attempts >= SC_MAX_DOWNLOAD_ATTEMPTS:
+            break
 
-async def download_track_from_youtube(artist: str, title: str) -> tuple[str | None, str | None, str | None]:
+    # 3. Фолбэк по исполнителю: берём топ его треков и ищем среди них нужное название
+    main_artist = (split_artists(artist) or [""])[0]
+    if main_artist and norm(main_artist) != "unknown" and attempts < SC_MAX_DOWNLOAD_ATTEMPTS:
+        logger.info(f"SoundCloud: фолбэк-поиск по исполнителю '{main_artist}'")
+        found = try_entries(_sc_search(main_artist, 25))
+        if found:
+            return found
+
+    logger.info(f"SoundCloud: ничего не подошло для {artist} - {title} (попыток скачивания: {attempts})")
+    return None, "error", None
+
+async def download_track_from_youtube(artist: str, title: str, duration: int = 0) -> tuple[str | None, str | None, str | None]:
+    """Имя оставлено прежним для совместимости (на деле — SoundCloud). duration (сек) — необязательная сверка длины."""
     safe_name = "".join(c for c in f"{artist} - {title}" if c.isalnum() or c in " -_").strip()
-    return await asyncio.to_thread(_sync_download, artist, title, safe_name)
+    return await asyncio.to_thread(_sync_download, artist, title, safe_name, duration)
+
+
+# ============================================================
+# ЕДИНАЯ ТОЧКА ВХОДА: Hitmo -> SoundCloud
+# ============================================================
+# Яндекс используется ТОЛЬКО для метаданных плейлиста (artist, title, duration, yandex_id).
+# Аудио оттуда не качаем: Яндекс отдаёт цензурированные версии.
+async def download_track_smart(track: dict) -> tuple[str | None, str | None, str | None]:
+    """track = {'artist', 'title', 'duration'?, ...}  ->  (file_path | None, err | None, source_url | None).
+
+    Лишние ключи (например 'yandex_id') игнорируются. duration (сек, из Яндекса) нужна для сверки
+    длины файла: так отсеиваются замедленные/ускоренные версии.
+    """
+    artist = track.get('artist') or ''
+    title = track.get('title') or ''
+    duration = int(track.get('duration') or 0)
+    last_err = None
+
+    # 1. Hitmo — основной источник
+    try:
+        path, err, src = await download_from_hitmo(artist, title, UPLOADS_DIR, duration)
+        if path:
+            ensure_track_has_cover(path, artist, title)
+            return path, None, src
+        last_err = err
+        logger.info(f"Hitmo не дал файл ({err}) для {artist} - {title}, пробую SoundCloud")
+    except Exception as e:
+        logger.error(f"Hitmo упал на {artist} - {title}: {e}")
+        last_err = "error"
+
+    # 2. SoundCloud — запасной (curl_cffi, перебор кандидатов, фолбэк по исполнителю)
+    path, err, src = await download_track_from_youtube(artist, title, duration)
+    if path:
+        return path, None, src
+    return None, (err or last_err or "not_found"), None
+
 
 # --- ФУНКЦИЯ: СКАЧИВАНИЕ ПО ПРЯМОЙ ССЫЛКЕ ---
 def _sync_download_by_url(url: str, filename: str) -> tuple[str | None, str | None, str | None]:
@@ -184,14 +339,8 @@ def find_soundcloud_link(query: str) -> str | None:
 def fix_audio_tags(file_path: str, artist: str, title: str) -> None:
     try:
         from mutagen.easyid3 import EasyID3
-        from mutagen.id3 import ID3NoHeaderError
-        from mutagen.mp3 import MP3
-        try:
-            audio = EasyID3(file_path)
-        except ID3NoHeaderError:
-            audio = MP3(file_path, ID3=EasyID3)
-            audio.add_tags()
-            audio = EasyID3(file_path)
+        _ensure_id3(file_path)  # у сырых mp3 (Яндекс/Hitmo) заголовка ID3 может не быть
+        audio = EasyID3(file_path)
         audio['artist'] = str(artist)
         audio['title'] = str(title)
         audio.save()
@@ -200,56 +349,39 @@ def fix_audio_tags(file_path: str, artist: str, title: str) -> None:
 
 # --- ОБЛОЖКИ: ПРОВЕРКА И ВШИВАНИЕ ИЗ SOUNDCLOUD ---
 def ensure_track_has_cover(file_path: str, artist: str, title: str) -> bool:
-    """Проверяет наличие обложки в MP3. Если нет — качает из SoundCloud и вшивает."""
-    try:
-        from mutagen.mp3 import MP3
-        from mutagen.id3 import ID3
-        audio = MP3(file_path, ID3=ID3)
-        if audio.tags and audio.tags.getall('APIC'):
-            return True
-    except Exception:
-        pass
+    """Проверяет наличие обложки в MP3. Если нет — ищет трек в SoundCloud и вшивает обложку в JPEG.
+
+    Кандидата сверяем по артисту и названию (раньше брался первый результат поиска вслепую
+    и мог подтянуться чужой трек).
+    """
+    if _has_cover(file_path):
+        return True
 
     try:
+        main_artist = (split_artists(artist) or [artist])[0]
+        query = f"{main_artist} {clean_title(title)}".strip()
         with yt_dlp.YoutubeDL({'quiet': True, 'skip_download': True}) as ydl:
-            result = ydl.extract_info(f"scsearch1:{artist} - {title} audio", download=False)
-            if not result or not result.get('entries'):
-                return False
-
-            entry = result['entries'][0]
-            thumb_url = None
-            if 'thumbnails' in entry:
+            result = ydl.extract_info(f"scsearch3:{query}", download=False)
+        for entry in ((result or {}).get('entries') or []):
+            if not entry:
+                continue
+            signature = f"{entry.get('uploader') or ''} - {entry.get('title') or ''}"
+            if not match_track(signature, artist, title):
+                continue
+            thumb_url = entry.get('thumbnail')
+            if entry.get('thumbnails'):
                 thumb_url = entry['thumbnails'][-1]['url']
-            elif 'thumbnail' in entry:
-                thumb_url = entry['thumbnail']
-
             if not thumb_url:
-                return False
-
+                continue
             response = requests.get(thumb_url, timeout=10)
             if response.status_code != 200:
-                return False
-
-            from mutagen.id3 import APIC, ID3NoHeaderError
-            try:
-                audio = MP3(file_path, ID3=ID3)
-            except ID3NoHeaderError:
-                audio = MP3(file_path)
-                audio.add_tags()
-                audio = MP3(file_path, ID3=ID3)
-
-            audio.tags.add(
-                APIC(
-                    encoding=3, mime='image/jpeg', type=3, desc='Cover',
-                    data=response.content
-                )
-            )
-            audio.save()
-            logger.info(f"Обложка успешно добавлена для {artist} - {title}")
-            return True
+                continue
+            if _embed_cover_bytes(file_path, response.content):
+                logger.info(f"Обложка (JPEG) успешно добавлена для {artist} - {title}")
+                return True
     except Exception as e:
         logger.error(f"Ошибка при добавлении обложки для {artist} - {title}: {e}")
-        return False
+    return False
 
 # --- СКАЧИВАНИЕ ПО ПРЯМОЙ ССЫЛКЕ (для /import одиночного трека) ---
 def _sync_download_direct_url(url: str, filename: str):

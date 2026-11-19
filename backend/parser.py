@@ -227,6 +227,21 @@ def parse_yandex_playlist(url: str) -> Tuple[List[Dict[str, str]], str]:
         if title: tracks.append(_track(title, artist_name, int(dur_ms / 1000) if dur_ms else 0))
     return tracks, playlist_title
 
+    for track_short in track_list:
+        title = getattr(track_short, "title", None)
+        artists = getattr(track_short, "artists", None)
+        dur_ms = getattr(track_short, "duration_ms", 0)
+        if (not title or not artists) and hasattr(track_short, "fetch_track"):
+            try:
+                full = track_short.fetch_track()
+                title = getattr(full, "title", title)
+                artists = getattr(full, "artists", artists)
+                dur_ms = getattr(full, "duration_ms", dur_ms)
+            except Exception: pass
+        artist_name = getattr(artists[0], "name", "Unknown") if artists else "Unknown"
+        if title: tracks.append(_track(title, artist_name, int(dur_ms / 1000) if dur_ms else 0))
+    return tracks, playlist_title
+
 def parse_spotify_playlist(url: str) -> Tuple[List[TrackDict], str]:
     playlist_id = _spotify_id(url)
     if playlist_id is None: raise ValueError(f"Невалидная ссылка на плейлист Spotify: {url!r}")
