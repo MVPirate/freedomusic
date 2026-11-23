@@ -4,8 +4,10 @@ import yt_dlp
 import requests
 import json
 import random
+from collections.abc import Iterator
 from pathlib import Path
 import logging
+from tempfile import TemporaryDirectory
 import uuid
 import re
 
@@ -13,12 +15,12 @@ import re
 try:
     from .hitmo_parser import (
         split_artists, clean_title, build_search_queries, match_track, norm, download_from_hitmo,
-        duration_ok, mp3_length, has_bad_marker, BAD_WORDS,
+        duration_ok, mp3_length, has_bad_marker,
     )
 except ImportError:  # модуль запущен не как пакет (backend/ добавлен в sys.path)
     from hitmo_parser import (
         split_artists, clean_title, build_search_queries, match_track, norm, download_from_hitmo,
-        duration_ok, mp3_length, has_bad_marker, BAD_WORDS,
+        duration_ok, mp3_length, has_bad_marker,
     )
 
 logger = logging.getLogger(__name__)
@@ -178,35 +180,17 @@ def _sc_download(url: str, ydl_opts: dict, base_path: Path) -> str | None:
             logger.warning(f"SoundCloud: не удалось скачать {url}: {e}")
     return None
 
-def _sync_download(artist: str, title: str, filename: str, duration: int = 0) -> tuple[str | None, str | None, str | None]:
-    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    base_path = UPLOADS_DIR / filename
-    ydl_opts = _get_ydl_opts(base_path)
+def _iter_matches(artist: str, title: str, duration: int) -> Iterator[str]:
+    """Перебирает подходящие ссылки, запрашивая следующий источник только при необходимости."""
+    seen: set[str] = set()
 
-    tried: set[str] = set()
-    attempts = 0
-
-    def try_entries(entries: list[dict], check_artist: bool = True):
-        """Перебирает кандидатов: фильтр -> скачивание; DRM/ошибка -> следующий."""
-        nonlocal attempts
+    def match_entries(entries: list[dict], check_artist: bool = True) -> Iterator[str]:
         for entry in entries:
-            if attempts >= SC_MAX_DOWNLOAD_ATTEMPTS:
-                return None
             url = entry.get('url')
-            if url in tried or not _sc_candidate_ok(entry, artist, title, duration, check_artist):
+            if not url or url in seen or not _sc_candidate_ok(entry, artist, title, duration, check_artist):
                 continue
-            tried.add(url)
-            attempts += 1
-            webpage_url = _sc_webpage_url(url)
-            path = _sc_download(url, ydl_opts, base_path)
-            if path:
-                real = mp3_length(path)
-                if duration and not duration_ok(real, duration):
-                    logger.warning(f"SoundCloud: длительность не совпала ({real:.0f}с вместо ~{duration}с), беру следующего: {url}")
-                    Path(path).unlink(missing_ok=True)
-                    continue
-                return path, None, (webpage_url or url)
-        return None
+            seen.add(url)
+            yield url
 
     # --- ПРОВЕРКА БЕЛОГО СПИСКА (по полной строке артистов и по каждому артисту отдельно) ---
     artist_url = None
@@ -225,26 +209,47 @@ def _sync_download(artist: str, title: str, filename: str, duration: int = 0) ->
 
     # 1. Официальная страница артиста — артиста внутри не проверяем, он и так «свой»
     if artist_url:
-        found = try_entries(_sc_list_page(f"{artist_url}/tracks"), check_artist=False)
-        if found:
-            return found
-        logger.info(f"На странице {artist} ничего не нашли или DRM. Переключаюсь на общий поиск...")
+        yield from match_entries(_sc_list_page(f"{artist_url}/tracks"), check_artist=False)
 
     # 2. Общий поиск: несколько вариантов запроса (главный артист + чистое название, все артисты, первые слова, ...)
     for query in build_search_queries(artist, title, limit=SC_MAX_QUERIES):
-        found = try_entries(_sc_search(query, 10))
-        if found:
-            return found
-        if attempts >= SC_MAX_DOWNLOAD_ATTEMPTS:
-            break
+        yield from match_entries(_sc_search(query, 10))
 
     # 3. Фолбэк по исполнителю: берём топ его треков и ищем среди них нужное название
     main_artist = (split_artists(artist) or [""])[0]
-    if main_artist and norm(main_artist) != "unknown" and attempts < SC_MAX_DOWNLOAD_ATTEMPTS:
+    if main_artist and norm(main_artist) != "unknown":
         logger.info(f"SoundCloud: фолбэк-поиск по исполнителю '{main_artist}'")
-        found = try_entries(_sc_search(main_artist, 25))
-        if found:
-            return found
+        yield from match_entries(_sc_search(main_artist, 25))
+
+
+def _download_candidate(url: str, destination: Path, duration: int) -> str | None:
+    # Свой временный каталог у каждой попытки: yt-dlp не переиспользует чужой .part.
+    with TemporaryDirectory(dir=destination.parent) as temp_dir:
+        base_path = Path(temp_dir) / "audio"
+        path = _sc_download(url, _get_ydl_opts(base_path), base_path)
+        if not path:
+            return None
+        real_duration = mp3_length(path)
+        if not real_duration or not duration_ok(real_duration, duration):
+            logger.warning(
+                "SoundCloud: неподходящая длительность (%.0f с, ожидалось ~%s с): %s",
+                real_duration, duration or "?", url,
+            )
+            return None
+        Path(path).replace(destination)
+    return str(destination)
+
+
+def _sync_download(artist: str, title: str, filename: str, duration: int = 0) -> tuple[str | None, str | None, str | None]:
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    destination = UPLOADS_DIR / f"{filename or 'track'}_{uuid.uuid4().hex[:12]}.mp3"
+    attempts = 0
+    for attempts, url in enumerate(_iter_matches(artist, title, duration), start=1):
+        path = _download_candidate(url, destination, duration)
+        if path:
+            return path, None, _sc_webpage_url(url) or url
+        if attempts >= SC_MAX_DOWNLOAD_ATTEMPTS:
+            break
 
     logger.info(f"SoundCloud: ничего не подошло для {artist} - {title} (попыток скачивания: {attempts})")
     return None, "error", None
@@ -256,7 +261,7 @@ async def download_track_from_youtube(artist: str, title: str, duration: int = 0
 
 
 # ============================================================
-# ЕДИНАЯ ТОЧКА ВХОДА: Hitmo -> SoundCloud
+# ЕДИНАЯ ТОЧКА ВХОДА: SoundCloud -> Hitmo
 # ============================================================
 # Яндекс используется ТОЛЬКО для метаданных плейлиста (artist, title, duration, yandex_id).
 # Аудио оттуда не качаем: Яндекс отдаёт цензурированные версии.
@@ -288,12 +293,16 @@ async def download_track_smart(track: dict) -> tuple[str | None, str | None, str
 
 
 # --- ФУНКЦИЯ: СКАЧИВАНИЕ ПО ПРЯМОЙ ССЫЛКЕ ---
-def _sync_download_by_url(url: str, filename: str) -> tuple[str | None, str | None, str | None]:
+def _sync_download_by_url(
+    url: str, filename: str, *, proxy: str | None = None
+) -> tuple[str | None, str | None, str | None]:
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     unique_filename = f"{filename}_{uuid.uuid4().hex[:6]}"
     base_path = UPLOADS_DIR / unique_filename
     ydl_opts = _get_ydl_opts(base_path)
-    
+    if proxy:
+        ydl_opts['proxy'] = proxy
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -310,6 +319,13 @@ def _sync_download_by_url(url: str, filename: str) -> tuple[str | None, str | No
 async def download_from_soundcloud_url(url: str, artist: str, title: str) -> tuple[str | None, str | None, str | None]:
     safe_name = "".join(c for c in f"{artist} - {title}" if c.isalnum() or c in " -_").strip()
     return await asyncio.to_thread(_sync_download_by_url, url, safe_name)
+
+
+async def download_from_youtube_url(url: str, artist: str, title: str) -> tuple[str | None, str | None, str | None]:
+    safe_name = "".join(c for c in f"{artist} - {title}" if c.isalnum() or c in " -_").strip()
+    proxy = os.getenv("HITMO_PROXY")
+    return await asyncio.to_thread(_sync_download_by_url, url, safe_name, proxy=proxy)
+
 
 def find_soundcloud_link(query: str) -> str | None:
     try:
@@ -401,3 +417,21 @@ def _sync_download_direct_url(url: str, filename: str):
 async def download_track_from_direct_url(url: str, artist: str, title: str):
     safe_name = "".join(c for c in f"{artist} - {title}" if c.isalnum() or c in " -_").strip()
     return await asyncio.to_thread(_sync_download_direct_url, url, safe_name)
+
+def extract_telegram_thumbnail(file_path: str) -> bytes | None:
+    from io import BytesIO
+    from mutagen.id3 import ID3
+    from PIL import Image
+    try:
+        tags = ID3(file_path)
+        frames = tags.getall("APIC")
+        if not frames:
+            return None
+        frame = next((f for f in frames if f.type == 3), frames[0])
+        img = Image.open(BytesIO(frame.data)).convert("RGB")
+        img.thumbnail((320, 320))
+        output = BytesIO()
+        img.save(output, format="JPEG", quality=85, optimize=True)
+        return output.getvalue()
+    except Exception:
+        return None

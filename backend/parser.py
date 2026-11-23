@@ -8,8 +8,8 @@ from typing import Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from yandex_music import Client
-from yandex_music.exceptions import YandexMusicError, UnauthorizedError, NotFoundError
+from yandex_music import Client, Playlist
+from yandex_music.exceptions import BadRequestError, YandexMusicError, UnauthorizedError, NotFoundError
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
@@ -149,7 +149,88 @@ def _yandex_artist_name(track: object) -> str:
     names = [getattr(artist, "name", "") for artist in artists if getattr(artist, "name", None)]
     return ", ".join(names)
 
-def parse_yandex_playlist(url: str) -> Tuple[List[Dict[str, str]], str]:
+class YandexPlaylistUnavailable(ValueError):
+    pass
+
+
+def yandex_sync_url(url: str) -> str:
+    try:
+        parsed, host, path = _parse_url(url)
+    except ValueError as exc:
+        raise ValueError("Вставьте ссылку на плейлист Яндекс Музыки.") from exc
+    if parsed.scheme not in {"https", "http"} or not _YANDEX_HOST_RE.fullmatch(host):
+        raise ValueError("Автосинхронизация поддерживает только плейлисты Яндекс Музыки.")
+    for pattern in (_YANDEX_USER_PLAYLIST, _YANDEX_LK_PLAYLIST, _YANDEX_UUID_PLAYLIST):
+        match = pattern.fullmatch(path)
+        if match:
+            if pattern is _YANDEX_USER_PLAYLIST:
+                owner, kind = match.groups()
+                if not re.fullmatch(r"[\w.-]+", owner, flags=re.ASCII):
+                    break
+                path = f"/users/{owner}/playlists/{kind}"
+            else:
+                path = path.lower().rstrip("/")
+            return f"https://music.yandex.ru{path}"
+    raise ValueError("Нужна ссылка на плейлист Яндекс Музыки. Проверьте ссылку в меню «Поделиться».")
+
+
+def _fetch_yandex_sync_playlist(client: Client, url: str):
+    target, parts = _yandex_target(url)
+    try:
+        if target == "user_playlist":
+            owner, kind = parts
+            playlist = client.users_playlists(kind=kind, user_id=owner, timeout=15)
+        else:
+            uuid = f"lk.{parts[0]}" if target == "lk_playlist" else parts[0]
+            if hasattr(client, "playlist"):
+                playlist = client.playlist(uuid, timeout=15)
+            else:
+                # The same endpoint through the request helper in older SDK releases.
+                playlist = Playlist.de_json(client.request.get(f"{client.base_url}/playlist/{uuid}", timeout=15), client)
+    except (NotFoundError, BadRequestError, UnauthorizedError) as exc:
+        raise YandexPlaylistUnavailable("Плейлист закрыт или недоступен. Проверьте доступ по ссылке.") from exc
+    if not playlist or getattr(playlist, "visibility", None) == "private" or getattr(playlist, "available", None) is False:
+        raise YandexPlaylistUnavailable("Плейлист закрыт или недоступен. Проверьте доступ по ссылке.")
+    return playlist
+
+
+def _ordered_yandex_tracks(client: Client, playlist) -> list[dict]:
+    entries = []
+    full_tracks = {}
+    for short in playlist.tracks or []:
+        track = getattr(short, "track", None) or short
+        track_id = getattr(short, "id", None) or getattr(short, "track_id", None) or getattr(track, "id", None)
+        if track_id is None:
+            continue
+        track_id = str(track_id)
+        entries.append(track_id)
+        if getattr(track, "title", None) and _yandex_artist_name(track):
+            full_tracks[track_id] = track
+
+    missing = list(dict.fromkeys(tid for tid in entries if tid not in full_tracks))
+    for offset in range(0, len(missing), 100):
+        for track in client.tracks(missing[offset:offset + 100], timeout=15) or []:
+            if track and getattr(track, "id", None) is not None:
+                full_tracks[str(track.id)] = track
+
+    tracks = []
+    for track_id in entries:
+        track = full_tracks.get(track_id)
+        title = getattr(track, "title", None)
+        duration = (getattr(track, "duration_ms", None) or 0) // 1000
+        tracks.append({**_track(title, _yandex_artist_name(track), duration), "source_id": track_id})
+    return tracks
+
+
+def parse_yandex_playlist(url: str, *, for_sync: bool = False) -> Tuple[List[Dict[str, str]], str]:
+    if for_sync:
+        url = yandex_sync_url(url)
+        client = get_yandex_client()
+        playlist = _fetch_yandex_sync_playlist(client, url)
+        if not playlist.tracks and getattr(playlist, "track_count", 0):
+            raise RuntimeError("Яндекс Музыка не вернула список треков.")
+        return _ordered_yandex_tracks(client, playlist), playlist.title or "Плейлист Яндекс Музыки"
+
     client = get_yandex_client()
     RE_LK_UUID = re.compile(r"music\.yandex\.[a-z]+/playlists/lk\.([0-9a-f\-]{36})", re.IGNORECASE)
     RE_PUBLIC_UUID = re.compile(r"music\.yandex\.[a-z]+/playlists/([0-9a-f\-]{36})", re.IGNORECASE)
