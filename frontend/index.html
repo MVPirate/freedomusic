@@ -2154,6 +2154,17 @@ body[data-theme="light"] .new-market-card {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.05);
 }
 body[data-theme="light"] .glow-text { text-shadow: none; }
+body[data-theme="light"] .new-search-input-wrap {
+  background: var(--card-bg);
+  border-color: #8b95a6;
+}
+body[data-theme="light"] .new-search-input-wrap:focus-within {
+  border-color: var(--blue);
+  outline: 2px solid var(--blue);
+  outline-offset: -2px;
+}
+body[data-theme="light"] .new-search-input-wrap input { color: var(--text-main); }
+body[data-theme="light"] .new-search-input-wrap input::placeholder { color: #596477; }
 body[data-theme="light"] .glow-border { box-shadow: 0 4px 12px rgba(0, 210, 255, 0.2); }
 body[data-theme="light"] #user-level,
 body[data-theme="light"] .new-level-name { color: #111 !important; }
@@ -2273,6 +2284,37 @@ body[data-theme="blue"] .bottom-nav { background: rgba(13, 20, 36, .96); }
   color: var(--premium-accent); font-size: 11px; font-weight: 700;
 }
 .playlist-sync-note { font-size: 13px; color: var(--text-muted); }
+.playlist-sync-help {
+  margin-top: 4px;
+  border: 1px solid var(--blue);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--blue) 12%, transparent);
+}
+.playlist-sync-help > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 44px;
+  padding: 8px 12px;
+  list-style: none;
+  font-weight: 600;
+  cursor: pointer;
+}
+.playlist-sync-help > summary::-webkit-details-marker { display: none; }
+.playlist-sync-help > summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.playlist-sync-help-chevron {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  margin-right: 3px;
+  border: solid currentColor;
+  border-width: 0 2px 2px 0;
+  transform: translateY(-2px) rotate(45deg);
+}
+.playlist-sync-help[open] .playlist-sync-help-chevron { transform: translateY(2px) rotate(225deg); }
+.playlist-sync-help-content { padding: 0 12px 12px; }
+.playlist-sync-help-content ul { margin: 0 0 8px; padding-inline-start: 20px; }
 .playlist-sync-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .playlist-sync-details { display: grid; gap: 8px; margin: 0; overflow-wrap: anywhere; }
 .playlist-sync-details dt { color: var(--text-muted); font-size: 12px; }
@@ -4354,8 +4396,9 @@ function showPlaylistSync({ is_premium: premium, source }) {
         <button class="ui-button" type="button" data-sync="pause">${source.paused ? 'Возобновить' : 'Поставить на паузу'}</button>` : ''}
       ${source ? '<button class="ui-button" type="button" data-sync="disconnect">Отключить</button><button class="ui-button" type="button" data-sync="refresh">Обновить</button>' : ''}
     </div>
-    ${source ? `<details>
-      <summary class="ui-button">Подробнее</summary>
+    ${source ? `<details class="playlist-sync-help">
+      <summary>Подробнее<span class="playlist-sync-help-chevron" aria-hidden="true"></span></summary>
+      <div class="playlist-sync-help-content">
       <ul class="playlist-sync-note">
         <li><strong>Сменить ссылку</strong> — выбрать другой плейлист в Яндекс Музыке.</li>
         <li><strong>Сменить назначение</strong> — выбрать, куда добавлять треки в FreeDom Music.</li>
@@ -4364,6 +4407,7 @@ function showPlaylistSync({ is_premium: premium, source }) {
         <li><strong>Обновить</strong> — показать свежий статус фоновой проверки.</li>
       </ul>
       <p class="playlist-sync-note">«Не удалось загрузить аудио» означает, что у бота пока нет файла для добавления. Он повторит попытку автоматически. Треки с готовым файлом, ожидающие одобрения, показаны в строке «На модерации».</p>
+      </div>
     </details>` : ''}</div>`);
   const bind = (name, callback) => {
     const button = body.querySelector(`[data-sync="${name}"]`);
