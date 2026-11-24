@@ -41,6 +41,7 @@ _VK_AUDIO_PLAYLIST = re.compile(r"audio_playlist(-?\d+)_(\d+)(?:_([0-9A-Za-z]+))
 
 _YANDEX_HOST_RE = re.compile(r"^(?:www\.)?music\.yandex\.(?:ru|com|by|kz|ua|uz)$", re.IGNORECASE)
 _YANDEX_ALBUM = re.compile(r"^/album/(\d+)/?", re.IGNORECASE)
+_YANDEX_TRACK = re.compile(r"^/(?:album/\d+/)?track/(\d+)/?$", re.IGNORECASE)
 _YANDEX_USER_PLAYLIST = re.compile(r"^/users/([^/]+)/playlists/(\d+)/?", re.IGNORECASE)
 _YANDEX_LK_PLAYLIST = re.compile(r"^/playlists/lk\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/?", re.IGNORECASE)
 _YANDEX_UUID_PLAYLIST = re.compile(r"^/playlists/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/?", re.IGNORECASE)
@@ -68,17 +69,26 @@ def _vk_ids(url: str) -> Optional[tuple[str, str, Optional[str]]]:
     return None
 
 def _yandex_target(url: str) -> Optional[tuple[str, tuple[str, ...]]]:
-    _parsed, host, path = _parse_url(url)
-    if not _YANDEX_HOST_RE.match(host): return None
-    album = _YANDEX_ALBUM.match(path)
+    parsed, host, path = _parse_url(url)
+    if parsed.scheme not in {"https", "http"} or not _YANDEX_HOST_RE.fullmatch(host): return None
+    track = _YANDEX_TRACK.fullmatch(path)
+    if track: return "track", (track.group(1),)
+    album = _YANDEX_ALBUM.fullmatch(path)
     if album: return "album", (album.group(1),)
-    user_pl = _YANDEX_USER_PLAYLIST.match(path)
+    user_pl = _YANDEX_USER_PLAYLIST.fullmatch(path)
     if user_pl: return "user_playlist", (user_pl.group(1), user_pl.group(2))
-    lk_pl = _YANDEX_LK_PLAYLIST.match(path)
+    lk_pl = _YANDEX_LK_PLAYLIST.fullmatch(path)
     if lk_pl: return "lk_playlist", (lk_pl.group(1),)
-    uuid_pl = _YANDEX_UUID_PLAYLIST.match(path)
+    uuid_pl = _YANDEX_UUID_PLAYLIST.fullmatch(path)
     if uuid_pl: return "uuid_playlist", (uuid_pl.group(1),)
     return None
+
+
+def is_yandex_import_url(url: str) -> bool:
+    try:
+        return _yandex_target(url) is not None
+    except ValueError:
+        return False
 
 def _spotify_id(url: str) -> Optional[str]:
     _parsed, host, path = _parse_url(url)
@@ -194,7 +204,7 @@ def _fetch_yandex_sync_playlist(client: Client, url: str):
     return playlist
 
 
-def _ordered_yandex_tracks(client: Client, playlist) -> list[dict]:
+def _ordered_yandex_objects(client: Client, playlist) -> list[tuple[str, object]]:
     entries = []
     full_tracks = {}
     for short in playlist.tracks or []:
@@ -213,13 +223,66 @@ def _ordered_yandex_tracks(client: Client, playlist) -> list[dict]:
             if track and getattr(track, "id", None) is not None:
                 full_tracks[str(track.id)] = track
 
+    return [(track_id, full_tracks.get(track_id)) for track_id in entries]
+
+
+def _ordered_yandex_tracks(client: Client, playlist) -> list[dict]:
     tracks = []
-    for track_id in entries:
-        track = full_tracks.get(track_id)
+    for track_id, track in _ordered_yandex_objects(client, playlist):
         title = getattr(track, "title", None)
         duration = (getattr(track, "duration_ms", None) or 0) // 1000
         tracks.append({**_track(title, _yandex_artist_name(track), duration), "source_id": track_id})
     return tracks
+
+
+def parse_yandex_import(url: str):
+    """Read track and release metadata without requesting audio."""
+    from backend import artist_catalog as catalog
+
+    target = _yandex_target(url)
+    if target is None:
+        raise ValueError("Вставьте ссылку Яндекс Музыки на трек, альбом или плейлист.")
+    kind, parts = target
+    client = get_yandex_client()
+    release = None
+    if kind == "track":
+        rows = client.tracks([parts[0]], timeout=15) or []
+        objects = [(parts[0], item) for item in rows if item and str(item.id) == parts[0]]
+        title = "Трек Яндекс Музыки"
+    elif kind == "album":
+        get_album = getattr(client, "albums_with_tracks", None) or client.album_with_tracks
+        album = get_album(parts[0], timeout=15)
+        release = catalog.CatalogSource.release(parts[0], album, album)
+        objects = [(str(item.id), item) for volume in album.volumes for item in volume]
+        title = release.title
+    else:
+        canonical_url = yandex_sync_url(url)
+        playlist = _fetch_yandex_sync_playlist(client, canonical_url)
+        objects = _ordered_yandex_objects(client, playlist)
+        title = playlist.title or "Плейлист Яндекс Музыки"
+
+    tracks = []
+    for track_id, item in objects:
+        try:
+            track = catalog.read_source_track(item, 1, len(tracks) + 1)
+        except (AttributeError, ValueError):
+            continue
+        if track.id != track_id:
+            continue
+        albums = [
+            (str(album.id), getattr(album, "title", None), catalog.cover_url(getattr(album, "cover_uri", None)))
+            for album in getattr(item, "albums", []) or [] if str(getattr(album, "id", "")).isdigit()
+        ]
+        if release and not any(album_id == release.id for album_id, _, _ in albums):
+            albums.append((release.id, release.title, release.cover_url))
+        image = catalog.cover_url(getattr(item, "cover_uri", None)) or next(
+            (cover for _, _, cover in albums if cover), None,
+        )
+        tracks.append({
+            **_track(track.display_title, track.artist, round((track.duration_ms or 0) / 1000)),
+            "source_id": track.id, "recording": catalog.recording_values(track, image), "releases": albums,
+        })
+    return tracks, title, release
 
 
 def parse_yandex_playlist(url: str, *, for_sync: bool = False) -> Tuple[List[Dict[str, str]], str]:

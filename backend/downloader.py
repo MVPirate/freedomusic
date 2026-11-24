@@ -121,7 +121,7 @@ def _has_cover(file_path: str) -> bool:
     except Exception:
         return False
 
-def _embed_cover_bytes(file_path: str, raw: bytes) -> bool:
+def embed_cover_bytes(file_path: str, raw: bytes) -> bool:
     """Любую картинку -> JPEG <=320px (лимиты Telegram) -> APIC в mp3."""
     try:
         from PIL import Image
@@ -462,7 +462,7 @@ def ensure_track_has_cover(file_path: str, artist: str, title: str) -> bool:
             response = requests.get(thumb_url, timeout=10)
             if response.status_code != 200:
                 continue
-            if _embed_cover_bytes(file_path, response.content):
+            if embed_cover_bytes(file_path, response.content):
                 logger.info(f"Обложка (JPEG) успешно добавлена для {artist} - {title}")
                 return True
     except Exception as e:

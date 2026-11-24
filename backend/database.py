@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import os
 import secrets
 import re
@@ -13,9 +14,13 @@ from contextlib import asynccontextmanager
 from uuid import uuid4
 import aiosqlite
 
-from backend.artist_catalog_store import ARTIST_CATALOG_SCHEMA, ARTIST_IMPORT_SCHEMA, CATALOG_DB_PATH
-from backend.artist_catalog_store import matches_artist_page, metadata_key, split_artist_credits
+from backend.artist_catalog_store import (
+    APPROVED_RECORDING_SQL, ARTIST_CATALOG_SCHEMA, ARTIST_IMPORT_INDEXES, ARTIST_IMPORT_ITEMS_TABLE,
+    ARTIST_IMPORT_SCHEMA, BIND_RECORDING_SQL, CATALOG_DB_PATH, RECORDING_SCHEMA, SAVE_RECORDING_SQL,
+    SAVE_RELEASE_MEMBER_SQL, artist_credit_keys, metadata_key, matches_artist_page, split_artist_credits,
+)
 from backend.config import ADMIN_ID
+from backend.moderation_store import SCHEMA as MODERATION_SCHEMA
 
 DB_PATH: str = str(CATALOG_DB_PATH)
 LIKED_PLAYLIST_TITLE = "❤️ Мне нравится"
@@ -187,8 +192,40 @@ async def init_mini_app_schema() -> None:
     async with get_db() as conn:
         await conn.executescript(MINI_APP_SCHEMA)
         await conn.executescript(ARTIST_CATALOG_SCHEMA)
+        await conn.executescript(RECORDING_SCHEMA)
         await conn.executescript(ARTIST_IMPORT_SCHEMA)
+        await conn.executescript(MODERATION_SCHEMA)
         await conn.execute("BEGIN IMMEDIATE")
+        async with conn.execute("PRAGMA table_info(artist_import_items)") as cursor:
+            columns = [row["name"] for row in await cursor.fetchall()]
+        if "album_request_id" not in columns:
+            await conn.execute("ALTER TABLE artist_import_items RENAME TO artist_import_items_old")
+            await conn.execute(ARTIST_IMPORT_ITEMS_TABLE)
+            copied = ", ".join(columns)
+            await conn.execute(
+                f"INSERT INTO artist_import_items ({copied}) SELECT {copied} FROM artist_import_items_old"
+            )
+            await conn.execute("DROP TABLE artist_import_items_old")
+        for index in ARTIST_IMPORT_INDEXES:
+            await conn.execute(index)
+        await conn.execute("""
+            INSERT OR IGNORE INTO yandex_recordings(source_id, track_id)
+            SELECT i.source_id, MIN(i.track_id) FROM artist_import_items i
+            JOIN tracks t ON t.id = i.track_id AND t.status = 'approved'
+            WHERE i.state IN ('approved', 'existing') AND i.album_request_id IS NULL
+            GROUP BY i.source_id HAVING COUNT(DISTINCT i.track_id) = 1
+        """)
+        await conn.execute("""
+            UPDATE artist_import_items AS i
+            SET state = 'existing', track_id = y.track_id, attempt = i.attempt + 1, lease_until = 0, issue = NULL
+            FROM yandex_recordings y JOIN tracks t ON t.id = y.track_id AND t.status = 'approved'
+            WHERE i.source_id = y.source_id AND i.state = 'rejected' AND i.album_request_id IS NULL
+        """)
+        for table in ("tracks", "telegram_topic_tracks"):
+            async with conn.execute(f"PRAGMA table_info({table})") as cursor:
+                columns = {row["name"] for row in await cursor.fetchall()}
+            if columns and "media_revision" not in columns:
+                await conn.execute(f"ALTER TABLE {table} ADD COLUMN media_revision INTEGER NOT NULL DEFAULT 0")
         async with conn.execute("PRAGMA table_info(playlist_sync_tracks)") as cursor:
             columns = {row["name"] for row in await cursor.fetchall()}
         if "batch" not in columns:
@@ -482,16 +519,20 @@ async def get_user(telegram_id: int) -> dict[str, Any]:
         async with conn.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)) as cursor:
             row = await cursor.fetchone()
             if row: return dict(row)
-        await conn.execute("INSERT INTO users (telegram_id) VALUES (?)", (telegram_id,))
+        await conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (telegram_id,))
         await conn.commit()
         async with conn.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)) as cursor:
             return dict(await cursor.fetchone())
 
+POINTS_WITH_XP_SQL = "UPDATE users SET points = points + ?, xp = xp + ? WHERE id = ?"
+POINTS_TRANSACTION_SQL = "INSERT INTO transactions (user_id, amount, reason) VALUES (?, ?, ?)"
+
+
 async def add_points(user_id: int, amount: int, reason: str = "bonus") -> dict[str, Any]:
     async with get_db() as conn:
-        if amount > 0: await conn.execute("UPDATE users SET points = points + ?, xp = xp + ? WHERE id = ?", (amount, amount, user_id))
+        if amount > 0: await conn.execute(POINTS_WITH_XP_SQL, (amount, amount, user_id))
         else: await conn.execute("UPDATE users SET points = points + ? WHERE id = ?", (amount, user_id))
-        await conn.execute("INSERT INTO transactions (user_id, amount, reason) VALUES (?, ?, ?)", (user_id, amount, reason))
+        await conn.execute(POINTS_TRANSACTION_SQL, (user_id, amount, reason))
         await conn.commit()
     return await check_level_up(user_id)
 
@@ -522,6 +563,14 @@ def _compute_file_hash(file_path: str | None, title: str, artist: str, user_id: 
 # ============================================================
 # ОБНОВЛЁННЫЙ UPLOAD_TRACK (нормализованная проверка дубликатов)
 # ============================================================
+INSERT_PENDING_TRACK_SQL = """
+    INSERT INTO tracks (title, artist, file_path, file_hash, source, source_url, uploaded_by, bitrate,
+        duration, original_duration, import_source, status, pending_playlist_id, pending_position,
+        artist_norm, title_norm)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+"""
+
+
 async def upload_track(user_id: int, title: str, artist: str, file_path: str, source: str, bitrate: int = 0, duration: int = 0, original_duration: int = 0, import_source: str = "unknown", pending_playlist_id: int | str | None = None, pending_position: int = 0, source_url: str = None, *, import_liked_after: list[int] | None = None, automatic: bool = False) -> dict[str, Any]:
     file_hash = _compute_file_hash(file_path, title, artist, user_id)
     
@@ -532,10 +581,15 @@ async def upload_track(user_id: int, title: str, artist: str, file_path: str, so
         await conn.execute("BEGIN IMMEDIATE")
         # Быстрая проверка по нормализованным колонкам
         async with conn.execute(
-            "SELECT * FROM tracks WHERE artist_norm = ? AND title_norm = ? LIMIT 1",
+            """SELECT * FROM tracks WHERE artist_norm = ? AND title_norm = ? AND status != 'rejected'
+               AND (status = 'approved' OR NOT EXISTS (
+                    SELECT 1 FROM yandex_import_submissions WHERE track_id = tracks.id
+               ))
+               ORDER BY status = 'approved' DESC, id""",
             (a_norm, t_norm)
         ) as cursor:
-            existing = await cursor.fetchone()
+            existing = next((row for row in await cursor.fetchall()
+                             if metadata_key(row["title"]) == metadata_key(title)), None)
 
         if existing:
             # Если трек был в базе, но файла нет — перезаписываем его, а не падаем
@@ -576,8 +630,7 @@ async def upload_track(user_id: int, title: str, artist: str, file_path: str, so
 
         try:
             cursor = await conn.execute(
-                """INSERT INTO tracks (title, artist, file_path, file_hash, source, source_url, uploaded_by, bitrate, duration, original_duration, import_source, status, pending_playlist_id, pending_position, artist_norm, title_norm)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+                INSERT_PENDING_TRACK_SQL,
                 (title, artist, file_path, file_hash, source, source_url, user_id, bitrate, duration, original_duration, import_source, pending_playlist_id, pending_position, a_norm, t_norm)
             )
             track_id = cursor.lastrowid
@@ -591,6 +644,181 @@ async def upload_track(user_id: int, title: str, artist: str, file_path: str, so
             return saved
         except aiosqlite.IntegrityError:
             raise ValueError("Трек с таким файлом уже существует (совпал хэш).")
+
+
+async def save_yandex_metadata(tracks: list[dict], release, cover=None) -> None:
+    import time
+
+    async with get_db() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        await conn.executemany(SAVE_RECORDING_SQL, (track["recording"] for track in tracks))
+        await conn.executemany(SAVE_RELEASE_MEMBER_SQL, (
+            (track["source_id"], *member) for track in tracks for member in track["releases"]
+        ))
+        if release:
+            now = time.time_ns()
+            credits = dict(person for track in release.tracks for person in track.credits)
+            for artist_id, name in credits.items():
+                key = metadata_key(name)
+                await conn.execute("""
+                    INSERT OR IGNORE INTO artist_catalog_bindings VALUES (?, ?, ?, ?, ?, ?)
+                """, (key, name, artist_id, name, now, now))
+                async with conn.execute(
+                    "SELECT artist_key FROM artist_catalog_bindings WHERE yandex_artist_id = ?", (artist_id,),
+                ) as cursor:
+                    binding = await cursor.fetchone()
+                if not binding:
+                    continue
+                key = binding["artist_key"]
+                await conn.execute("""
+                    INSERT INTO artist_catalog_albums
+                        (artist_key, album_id, title, year, release_type, cover_url, cover, cover_mime)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(artist_key, album_id) DO UPDATE SET
+                        cover = COALESCE(cover, excluded.cover), cover_mime = COALESCE(cover_mime, excluded.cover_mime)
+                """, (key, release.id, release.title, release.year, release.kind, release.cover_url, *(cover or (None, None))))
+                await conn.executemany("""
+                    INSERT OR IGNORE INTO artist_catalog_tracks
+                        (artist_key, album_id, disc, position, yandex_track_id, title, artist, duration_ms, track_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, (
+                        SELECT track_id FROM yandex_recordings WHERE source_id = ?
+                    ))
+                """, ((key, release.id, track.disc, track.position, track.id, track.display_title,
+                       track.artist, track.duration_ms, track.id) for track in release.tracks))
+        await conn.commit()
+
+
+async def _find_yandex_track(conn, source_id: str, digest: str | None = None):
+    from backend.artist_catalog import DURATION_TOLERANCE_MS, yandex_path_id
+
+    async with conn.execute(APPROVED_RECORDING_SQL, (source_id,)) as cursor:
+        canonical = await cursor.fetchone()
+    if canonical:
+        return canonical if canonical["file_path"] and os.path.isfile(canonical["file_path"]) else None
+    async with conn.execute("SELECT * FROM yandex_recordings WHERE source_id = ?", (source_id,)) as cursor:
+        recording = await cursor.fetchone()
+    if not recording or not recording["title"]:
+        return None
+    async with conn.execute("""
+        SELECT t.* FROM tracks t WHERE t.status = 'approved' AND
+            (t.title_norm = ? OR t.file_hash = ? OR (t.source_url LIKE '%music.yandex.%' AND t.source_url LIKE '%/track/%'))
+          AND NOT EXISTS (SELECT 1 FROM yandex_recordings y WHERE y.track_id = t.id)
+    """, (norm_key(recording["title"]), digest)) as cursor:
+        candidates = [row for row in await cursor.fetchall() if row["file_path"] and os.path.isfile(row["file_path"])]
+    names = await _read_confirmed_artist_names(conn)
+    credits = {metadata_key(name) for _, name in json.loads(recording["credits"])}
+    direct = []
+    identical = []
+    matches = []
+    for row in candidates:
+        linked_id = yandex_path_id(row["source_url"] or "", r"/(?:album/[0-9]+/)?track/([0-9]+)/?")
+        if linked_id:
+            if linked_id == source_id:
+                direct.append(row)
+        elif (metadata_key(row["title"]) == metadata_key(recording["title"])
+              and row["duration"] and recording["duration_ms"]
+              and abs(1000 * row["duration"] - recording["duration_ms"]) <= DURATION_TOLERANCE_MS):
+            existing_credits = artist_credit_keys(row["artist"], set(names) | credits)
+            if digest and row["file_hash"] == digest and existing_credits & credits:
+                identical.append(row)
+            elif existing_credits == credits:
+                matches.append(row)
+    choices = direct or identical or matches
+    return choices[0] if len(choices) == 1 else None
+
+
+async def find_yandex_track(source_id: str) -> dict | None:
+    async with get_db() as conn:
+        track = await _find_yandex_track(conn, source_id)
+        return dict(track) if track else None
+
+
+async def _apply_import_destination(conn, track_id, user_id, destination, position, liked_after=()):
+    if destination == "liked":
+        return await _insert_import_like(conn, user_id, track_id, liked_after)
+    if destination is not None:
+        await conn.execute("""
+            INSERT INTO playlist_tracks(playlist_id, track_id, position)
+            SELECT id, ?, ? FROM user_playlists WHERE id = ? AND user_id = ? AND is_system = 0
+                AND NOT EXISTS (SELECT 1 FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?)
+        """, (track_id, position, destination, user_id, destination, track_id))
+    return False
+
+
+async def reuse_import_track(track_id, user_id, destination, position, liked_after=None):
+    async with get_db() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        added = await _apply_import_destination(conn, track_id, user_id, destination, position, liked_after or [])
+        await conn.commit()
+        return added
+
+
+async def _bind_import_recording(conn, source_id, track_id):
+    await conn.execute(BIND_RECORDING_SQL, (track_id, source_id, track_id))
+    await conn.execute("""
+        UPDATE artist_import_items SET state = 'existing', track_id = ?, attempt = attempt + 1,
+            lease_until = 0, issue = NULL
+        WHERE source_id = ? AND compare_existing = 0
+            AND (state IN ('queued', 'searching', 'missing') OR (state = 'rejected' AND album_request_id IS NULL))
+    """, (track_id, source_id))
+
+
+async def save_yandex_import(source_id, user_id, artist, title, original_duration, destination, position,
+                             liked_after, *, audio=None):
+    digest = await asyncio.to_thread(_compute_file_hash, audio[0], title, artist, user_id) if audio else None
+    async with get_db() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        existing = await _find_yandex_track(conn, source_id, digest)
+        if existing:
+            track_id = existing["id"]
+            await _bind_import_recording(conn, source_id, track_id)
+            added = await _apply_import_destination(conn, track_id, user_id, destination, position, liked_after or [])
+            await conn.commit()
+            return dict(existing, import_like_added=added, new_audio=False)
+
+        async with conn.execute("""
+            SELECT t.* FROM yandex_import_submissions s JOIN tracks t ON t.id = s.track_id
+            WHERE s.source_id = ? AND t.status = 'pending' ORDER BY t.id LIMIT 1
+        """, (source_id,)) as cursor:
+            pending = await cursor.fetchone()
+        pending_has_file = bool(pending and pending["file_path"] and os.path.isfile(pending["file_path"]))
+        if audio is None and not pending_has_file:
+            return None
+        new_audio = False
+        if pending:
+            track_id = pending["id"]
+            if audio and not pending_has_file:
+                path, source_url, bitrate, duration = audio
+                await conn.execute("""
+                    UPDATE tracks SET file_path = ?, file_hash = ?, source_url = ?, source = ?,
+                        bitrate = ?, duration = ?, uploaded_by = ?, file_id = NULL WHERE id = ?
+                """, (path, digest, source_url, _import_audio_source(source_url), bitrate, duration, user_id, track_id))
+                new_audio = bool(path)
+        else:
+            path, source_url, bitrate, duration = audio
+            cursor = await conn.execute(INSERT_PENDING_TRACK_SQL, (
+                title, artist, path, digest, _import_audio_source(source_url), source_url, user_id, bitrate,
+                duration, original_duration, "yandex", None, 0, norm_key(normalize_artist(artist)), norm_key(title),
+            ))
+            track_id = cursor.lastrowid
+            await conn.execute("INSERT INTO yandex_import_submissions VALUES (?, ?)", (track_id, source_id))
+            new_audio = bool(path)
+        like_added = False
+        if destination == "liked":
+            like_added = await _insert_import_like(conn, user_id, track_id, liked_after or [])
+        elif destination is not None:
+            await conn.execute("""
+                INSERT OR IGNORE INTO yandex_import_destinations(track_id, user_id, destination, position)
+                VALUES (?, ?, ?, ?)
+            """, (track_id, user_id, str(destination), position))
+        await conn.commit()
+        return {"id": track_id, "status": "pending", "new_audio": new_audio, "import_like_added": like_added}
+
+
+def _import_audio_source(source_url):
+    if not source_url:
+        return "failed_download"
+    return "hitmo" if "hitmo" in source_url.lower() else "soundcloud"
 
 async def import_playlist(user_id: int, source_url: str, source_type: str, is_paid: bool) -> dict[str, Any]:
     async with get_db() as conn:
@@ -749,20 +977,16 @@ async def check_track_exists(artist: str, title: str) -> int | None:
 
     async with get_db() as conn:
         async with conn.execute(
-            "SELECT id, file_path FROM tracks WHERE artist_norm = ? AND title_norm = ? LIMIT 1",
+            """SELECT id, file_path, title FROM tracks
+               WHERE artist_norm = ? AND title_norm = ? AND status != 'rejected'
+               ORDER BY status = 'approved' DESC, id""",
             (a_norm, t_norm)
         ) as cursor:
-            row = await cursor.fetchone()
-
-        if not row:
-            return None
-
-        if row["file_path"] and os.path.isfile(row["file_path"]):
-            return row["id"]
-
-        # Просто возвращаем -1. Не удаляем, чтобы не сломать внешние ключи (плейлисты/лайки).
-        # upload_track увидит существующую запись и перезапишет её новым файлом.
-        return -1
+            matches = [row for row in await cursor.fetchall() if metadata_key(row["title"]) == metadata_key(title)]
+        for row in matches:
+            if row["file_path"] and os.path.isfile(row["file_path"]):
+                return row["id"]
+        return -1 if matches else None
 # ============================================================
 
 async def get_pending_tracks(limit: int = 10) -> list[dict[str, Any]]:
@@ -770,11 +994,13 @@ async def get_pending_tracks(limit: int = 10) -> list[dict[str, Any]]:
         async with conn.execute("SELECT * FROM tracks WHERE status = 'pending' ORDER BY id ASC LIMIT ?", (limit,)) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
-async def update_track_status(track_id: int, new_status: str, admin_id: int) -> None:
+async def update_track_status(track_id: int, new_status: str, admin_id: int) -> int | None:
     async with get_db() as conn:
         await conn.execute("BEGIN IMMEDIATE")
         async with conn.execute(
-            "SELECT status, bitrate, uploaded_by, pending_playlist_id, pending_position FROM tracks WHERE id = ?",
+            """SELECT t.status, t.bitrate, t.uploaded_by, t.pending_playlist_id, t.pending_position,
+                      t.file_path, s.source_id
+               FROM tracks t LEFT JOIN yandex_import_submissions s ON s.track_id = t.id WHERE t.id = ?""",
             (track_id,),
         ) as cursor:
             row = await cursor.fetchone()
@@ -782,20 +1008,39 @@ async def update_track_status(track_id: int, new_status: str, admin_id: int) -> 
             return
 
         quality = 'none'
+        published_id = track_id
         if new_status == 'approved':
-            quality = 'Verified+' if (row["bitrate"] or 0) >= 320 else 'Verified'
+            quality = 'Verified+' if not row["source_id"] and (row["bitrate"] or 0) >= 320 else 'Verified'
             destination = row["pending_playlist_id"]
             position = row["pending_position"]
-            if destination == 'liked':
-                await _insert_import_like(conn, row["uploaded_by"], track_id, [])
-            elif destination is not None:
-                await conn.execute(
-                    """INSERT INTO playlist_tracks (playlist_id, track_id, position)
-                       SELECT ?, ?, ? WHERE NOT EXISTS (
-                           SELECT 1 FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?
-                       )""",
-                    (destination, track_id, position, destination, track_id),
-                )
+            if row["source_id"]:
+                async with conn.execute(APPROVED_RECORDING_SQL, (row["source_id"],)) as cursor:
+                    existing = await cursor.fetchone()
+                if existing:
+                    published_id = existing["id"]
+                elif not row["file_path"] or not os.path.isfile(row["file_path"]):
+                    raise ValueError("Для одобрения нужен доступный аудиофайл.")
+                async with conn.execute("""
+                    SELECT user_id, destination, position FROM yandex_import_destinations WHERE track_id = ?
+                """, (track_id,)) as cursor:
+                    for pending in await cursor.fetchall():
+                        await _apply_import_destination(conn, published_id, pending["user_id"],
+                                                        pending["destination"], pending["position"], [])
+                await conn.execute("DELETE FROM yandex_import_destinations WHERE track_id = ?", (track_id,))
+                if published_id != track_id:
+                    async with conn.execute("SELECT user_id FROM likes WHERE track_id = ?", (track_id,)) as cursor:
+                        followers = await cursor.fetchall()
+                    await conn.execute("UPDATE OR IGNORE likes SET track_id = ? WHERE track_id = ?",
+                                       (published_id, track_id))
+                    await conn.execute("DELETE FROM likes WHERE track_id = ?", (track_id,))
+                    for follower in followers:
+                        await _sync_liked_playlist(conn, follower["user_id"])
+                    await conn.execute("UPDATE tracks SET status = 'rejected', verified_by = ? WHERE id = ?",
+                                       (admin_id, track_id))
+                    await _stop_sync_track(conn, track_id)
+                    await conn.commit()
+                    return published_id
+            await _apply_import_destination(conn, track_id, row["uploaded_by"], destination, position, [])
             await conn.execute(
                 "UPDATE tracks SET pending_playlist_id = NULL, pending_position = 0 WHERE id = ?",
                 (track_id,),
@@ -803,6 +1048,8 @@ async def update_track_status(track_id: int, new_status: str, admin_id: int) -> 
 
         await conn.execute("UPDATE tracks SET status = ?, verified_by = ?, quality_status = ? WHERE id = ?", (new_status, admin_id, quality, track_id))
         if new_status == "approved" and row["status"] != "approved":
+            if row["source_id"]:
+                await _bind_import_recording(conn, row["source_id"], track_id)
             await conn.execute("""
                 UPDATE playlist_sync_tracks SET state = 'recheck', retry_at = 0
                 WHERE track_id = ? AND state IN ('pending', 'unavailable', 'rejected', 'verified')
@@ -815,6 +1062,7 @@ async def update_track_status(track_id: int, new_status: str, admin_id: int) -> 
         elif new_status == "rejected":
             await _stop_sync_track(conn, track_id)
         await conn.commit()
+        return published_id if new_status == "approved" else None
 
 # ============================================================
 # ОБНОВЛЁННЫЙ SEARCH_TRACKS (безопасный FTS5)
@@ -877,13 +1125,21 @@ def is_premium_active(user: dict, *, now: datetime | None = None) -> bool:
     return expiry is not None and expiry > (now or datetime.now(timezone.utc))
 
 
-async def give_premium(user_id: int, days: int) -> datetime:
+async def give_premium(user_id: int, days: int, *, payment: tuple[str, int, datetime] | None = None) -> datetime:
     async with get_db() as conn:
         await conn.execute("BEGIN IMMEDIATE")
         async with conn.execute("SELECT premium_expires_at FROM users WHERE id = ?", (user_id,)) as cur:
             row = await cur.fetchone()
         now = datetime.now(timezone.utc).replace(microsecond=0)
         expiry = parse_premium_expiry(row["premium_expires_at"]) if row else None
+        if payment:
+            charge, stars, paid_at = payment
+            cursor = await conn.execute("""
+                INSERT INTO premium_payments(charge_id, user_id, stars, paid_at) VALUES (?, ?, ?, ?)
+                ON CONFLICT(charge_id) DO NOTHING
+            """, (charge, user_id, stars, paid_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")))
+            if not cursor.rowcount:
+                return expiry or now
         if expiry and expiry <= now:
             await _reset_premium_quota(conn, user_id)
             await _queue_premium_topic_purges(conn, user_id)
@@ -1327,13 +1583,22 @@ async def sync_liked_playlist(user_id: int) -> int:
 async def get_import_liked_tracks(user_id: int) -> dict[tuple[str, str], int]:
     async with get_db() as conn:
         async with conn.execute(
-            """SELECT t.artist_norm, t.title_norm, t.id
+            """SELECT t.artist_norm, t.title, t.id
                FROM likes l JOIN tracks t ON t.id = l.track_id
                WHERE l.user_id = ? ORDER BY l.position, l.rowid""",
             (user_id,),
         ) as cursor:
-            return {(row["artist_norm"], row["title_norm"]): row["id"]
-                    for row in reversed(await cursor.fetchall())}
+            result = {(row["artist_norm"], metadata_key(row["title"])): row["id"]
+                      for row in reversed(await cursor.fetchall())}
+        async with conn.execute("""
+            SELECT y.source_id, y.track_id FROM likes l
+            JOIN yandex_recordings y ON y.track_id = l.track_id WHERE l.user_id = ?
+            UNION
+            SELECT s.source_id, s.track_id FROM likes l
+            JOIN yandex_import_submissions s ON s.track_id = l.track_id WHERE l.user_id = ?
+        """, (user_id, user_id)) as cursor:
+            result.update({("yandex", row["source_id"]): row["track_id"] for row in await cursor.fetchall()})
+        return result
 
 
 async def get_cached_import_keys(keys: list[tuple[str, str]]) -> set[tuple[str, str]]:
@@ -1341,14 +1606,16 @@ async def get_cached_import_keys(keys: list[tuple[str, str]]) -> set[tuple[str, 
         return set()
     async with get_db() as conn:
         async with conn.execute(
-            """SELECT t.artist_norm, t.title_norm, t.file_path
+            """SELECT t.artist_norm, t.title, t.file_path, json_extract(input.value, '$[2]') AS expected_title
                FROM json_each(?) AS input
                JOIN tracks t ON t.artist_norm = json_extract(input.value, '$[0]')
-                            AND t.title_norm = json_extract(input.value, '$[1]')""",
-            (json.dumps(keys),),
+                            AND t.title_norm = json_extract(input.value, '$[1]')
+               WHERE t.status != 'rejected'""",
+            (json.dumps([(artist, norm_key(title), title) for artist, title in keys]),),
         ) as cursor:
-            return {(row["artist_norm"], row["title_norm"]) for row in await cursor.fetchall()
-                    if row["file_path"] and os.path.isfile(row["file_path"])}
+            return {(row["artist_norm"], row["expected_title"]) for row in await cursor.fetchall()
+                    if metadata_key(row["title"]) == row["expected_title"]
+                    and row["file_path"] and os.path.isfile(row["file_path"])}
 
 
 async def move_likes_to_top(user_id: int, track_ids: list[int]) -> None:
@@ -1432,12 +1699,14 @@ async def replace_track_file(track_id: int, new_file_path: str, bitrate: int, du
             
         if new_source_url:
             await conn.execute(
-                "UPDATE tracks SET file_path = ?, bitrate = ?, duration = ?, status = 'pending', source_url = ?, file_id = NULL WHERE id = ?",
+                """UPDATE tracks SET file_path = ?, bitrate = ?, duration = ?, status = 'pending',
+                   source_url = ?, file_id = NULL, media_revision = media_revision + 1 WHERE id = ?""",
                 (new_file_path, bitrate, duration, new_source_url, track_id)
             )
         else:
             await conn.execute(
-                "UPDATE tracks SET file_path = ?, bitrate = ?, duration = ?, status = 'pending', file_id = NULL WHERE id = ?",
+                """UPDATE tracks SET file_path = ?, bitrate = ?, duration = ?, status = 'pending',
+                   file_id = NULL, media_revision = media_revision + 1 WHERE id = ?""",
                 (new_file_path, bitrate, duration, track_id)
             )
         await conn.commit()
@@ -1590,7 +1859,14 @@ TRACK_INTERACTIONS_SQL = """
 
 async def _read_confirmed_artist_names(conn: aiosqlite.Connection) -> dict[str, str]:
     async with conn.execute("SELECT artist_key, artist_name FROM artist_catalog_bindings") as cursor:
-        return {row["artist_key"]: row["artist_name"] for row in await cursor.fetchall()}
+        names = {row["artist_key"]: row["artist_name"] for row in await cursor.fetchall()}
+    async with conn.execute("""
+        SELECT DISTINCT json_extract(c.value, '$[1]') AS name
+        FROM yandex_recordings y JOIN json_each(y.credits) c WHERE y.track_id IS NOT NULL
+    """) as cursor:
+        for row in await cursor.fetchall():
+            names.setdefault(metadata_key(row["name"]), row["name"])
+    return names
 
 
 IMPORTED_ARTIST_CREDITS_SQL = """
@@ -1601,6 +1877,11 @@ IMPORTED_ARTIST_CREDITS_SQL = """
     JOIN artist_import_batches b ON b.id = i.batch_id
     JOIN artist_catalog_bindings a ON a.artist_key = b.artist_key
     WHERE i.track_id IS NOT NULL AND i.state IN ('approved', 'existing')
+    UNION ALL
+    SELECT y.track_id, json_extract(c.value, '$[1]') AS artist, a.artist_key, a.artist_name
+    FROM yandex_recordings y JOIN json_each(y.credits) c
+    LEFT JOIN artist_catalog_bindings a ON a.yandex_artist_id = json_extract(c.value, '$[0]')
+    WHERE y.track_id IS NOT NULL
 """
 
 ARTIST_PAGE_FILTER = f"""status = 'approved' AND (on_artist_page(artist) OR id IN (
@@ -1619,14 +1900,14 @@ async def _bind_artist_page_filter(conn: aiosqlite.Connection, key: str) -> dict
 async def _read_imported_artist_credits(
     conn: aiosqlite.Connection, track_ids: list[int] | None = None,
 ) -> dict[int, list[str]]:
-    query = IMPORTED_ARTIST_CREDITS_SQL
+    query = "SELECT * FROM (" + IMPORTED_ARTIST_CREDITS_SQL + ")"
     if track_ids is not None:
         if not track_ids:
             return {}
         placeholders = ", ".join("?" for _ in track_ids)
-        query += f" AND i.track_id IN ({placeholders})"
+        query += f" WHERE track_id IN ({placeholders})"
     result: dict[int, list[str]] = {}
-    async with conn.execute(query + " ORDER BY i.id", track_ids or []) as cursor:
+    async with conn.execute(query + " ORDER BY track_id", track_ids or []) as cursor:
         async for row in cursor:
             credits = result.setdefault(row["track_id"], [])
             credits.append(row["artist"])
@@ -1775,9 +2056,9 @@ async def get_artist_album_cover(artist_name: str, album_id: str) -> tuple[bytes
             row = await cursor.fetchone()
             return (row["cover"], row["cover_mime"]) if row else None
 
-async def set_track_file_id(track_id: int, file_id: str) -> None:
+async def set_track_file_id(track_id: int, file_id: str, *, file_path: str) -> None:
     async with get_db() as conn:
-        await conn.execute("UPDATE tracks SET file_id = ? WHERE id = ?", (file_id, track_id))
+        await conn.execute("UPDATE tracks SET file_id = ? WHERE id = ? AND file_path = ?", (file_id, track_id, file_path))
         await conn.commit()
 
 async def get_tracks_without_file_id() -> list[dict[str, Any]]:
@@ -2093,7 +2374,8 @@ async def get_topic_sync_snapshot(topic_id: int, sync_token: str) -> tuple[dict,
             raise TopicClaimLost(topic_id)
 
         async with conn.execute("""
-            SELECT t.id, t.artist, t.title, t.duration, t.file_id, t.file_path, COALESCE(pt.position, 0) AS position
+            SELECT t.id, t.artist, t.title, t.duration, t.file_id, t.file_path, t.media_revision,
+                COALESCE(pt.position, 0) AS position
             FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
             WHERE pt.playlist_id = ? AND t.status = 'approved'
             ORDER BY pt.position ASC, pt.added_at DESC, pt.id DESC
@@ -2102,7 +2384,7 @@ async def get_topic_sync_snapshot(topic_id: int, sync_token: str) -> tuple[dict,
             for row in await cursor.fetchall():
                 tracks.setdefault(row["id"], dict(row))
         async with conn.execute("""
-            SELECT track_id, message_id, position FROM telegram_topic_tracks WHERE topic_id = ?
+            SELECT track_id, message_id, position, media_revision FROM telegram_topic_tracks WHERE topic_id = ?
         """, (topic_id,)) as cursor:
             messages = [dict(row) for row in await cursor.fetchall()]
         return dict(topic), list(tracks.values()), messages
@@ -2173,15 +2455,20 @@ async def set_topic_thread_id(topic_id: int, sync_token: str, thread_id: int) ->
 
 
 async def add_topic_track(
-    topic_id: int, sync_token: str, track_id: int, message_id: int, position: int, file_id: str | None
+    topic_id: int, sync_token: str, track_id: int, message_id: int, position: int, file_id: str | None,
+    media_revision: int = 0,
 ) -> None:
     async with get_db() as conn:
         await _refresh_topic_claim(conn, topic_id, sync_token)
         await conn.execute("""
-            INSERT INTO telegram_topic_tracks (topic_id, track_id, message_id, position) VALUES (?, ?, ?, ?)
-        """, (topic_id, track_id, message_id, position))
+            INSERT INTO telegram_topic_tracks (topic_id, track_id, message_id, position, media_revision)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(topic_id, track_id) DO UPDATE SET message_id = excluded.message_id,
+                position = excluded.position, media_revision = excluded.media_revision
+        """, (topic_id, track_id, message_id, position, media_revision))
         if file_id:
-            await conn.execute("UPDATE tracks SET file_id = ? WHERE id = ? AND file_id IS NULL", (file_id, track_id))
+            await conn.execute("""UPDATE tracks SET file_id = ? WHERE id = ? AND file_id IS NULL
+                                  AND media_revision = ?""", (file_id, track_id, media_revision))
         await conn.commit()
 
 

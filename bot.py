@@ -7,14 +7,19 @@ import sys
 import subprocess
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape as esc
 from math import ceil
 from pathlib import Path
 from time import monotonic
 from typing import Any
 from urllib.parse import urlsplit
+from uuid import uuid4
+from zoneinfo import ZoneInfo
 
+from backend import album_import
+from backend.artist_catalog import fetch_cover
+from backend.artist_catalog_store import metadata_key
 from backend.offline import offline_purge_worker, offline_worker
 from backend.playlist_sync import job_active, playlist_sync_worker
 from aiogram import Bot, Dispatcher, F
@@ -22,7 +27,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
-    Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, 
+    Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, ForceReply,
     CallbackQuery, FSInputFile, LabeledPrice, PreCheckoutQuery,
     ReplyKeyboardMarkup, KeyboardButton, MenuButtonWebApp, 
     BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
@@ -33,6 +38,9 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from dotenv import load_dotenv
 
 from backend.config import TELEGRAM_BOT_TOKEN, ADMIN_ID
+from backend import admin_report
+from backend.complaints_bot import register as register_complaints
+from backend.moderation_menu import render_panel
 from backend.artist_import import worker as artist_import_worker
 from backend.artist_import_bot import register as register_artist_import
 from backend.import_messages import PLAYLIST_IMPORT_INSTRUCTIONS
@@ -50,16 +58,19 @@ from backend.database import (
     set_track_file_id, get_tracks_without_file_id,
     get_user_playlists,
     reserve_downloads, refund_downloads, get_import_liked_tracks, move_likes_to_top,
-    add_import_like, get_cached_import_keys, normalize_artist, norm_key
+    add_import_like, get_cached_import_keys, normalize_artist, norm_key,
+    find_yandex_track, reuse_import_track, save_yandex_import, save_yandex_metadata,
 )
 from backend.playlist_media import TRAILER_MAX_BYTES, upload_playlist_trailer
-from backend.parser import detect_source, parse_playlist, get_yandex_client, parse_single_track
+from backend.parser import (
+    detect_source, get_yandex_client, is_yandex_import_url, parse_playlist, parse_single_track, parse_yandex_import,
+)
 from backend.downloader import (
     download_track_from_youtube, fix_audio_tags, FFMPEG_PATH, find_soundcloud_link,
     download_from_soundcloud_url, download_from_youtube_url, ensure_track_has_cover,
-    download_track_from_direct_url, download_track_smart, extract_telegram_thumbnail
+    download_track_from_direct_url, download_track_smart, embed_cover_bytes, extract_telegram_thumbnail
 )
-from backend.hitmo_parser import download_from_hitmo, parse_artist_page_hitmo
+from backend.hitmo_parser import download_from_hitmo, duration_ok, parse_artist_page_hitmo
 
 try:
     from mutagen.mp3 import MP3
@@ -82,11 +93,13 @@ bot: Bot = Bot(
 )
 dp: Dispatcher = Dispatcher()
 register_artist_import(dp)
+register_complaints(dp)
 
 waiting_for_replacement = {}
 processing_full_tracks = set()
 
 pending_imports = {}
+ALBUM_REPLY = re.compile(r"\nЗаявка альбома #(\d+)\Z")
 
 def log(text: str) -> None:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -195,6 +208,17 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
     try:
         user = await _ensure_user(message)
         args = command.args
+        if args and args.startswith("album_") and message.chat.type == "private":
+            request = await album_import.open_request(user["id"], args.removeprefix("album_"))
+            if request is None:
+                return await message.answer("Код заявки уже использован или истёк. Создайте новую заявку в альбоме.")
+            await message.answer(
+                f"<b>{esc(request['album_title'][:200])}</b>\n"
+                "Ответьте на это сообщение ссылкой Яндекс Музыки на трек, альбом или плейлист."
+                f"\nЗаявка альбома #{request['id']}",
+                reply_markup=ForceReply(),
+            )
+            return
         if args and args.startswith("ref_") and not user.get("referrer_id"):
             try:
                 referrer_tg_id = int(args.split("_")[1])
@@ -284,7 +308,12 @@ async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
 @dp.message(F.successful_payment)
 async def process_successful_payment(message: Message) -> None:
     user = await _ensure_user(message)
-    expiry = await give_premium(int(user["id"]), 30)
+    paid = message.successful_payment
+    if paid.currency != "XTR" or paid.invoice_payload not in {"premium_30_days", f"premium_30_days_{message.from_user.id}"}:
+        return
+    expiry = await give_premium(
+        int(user["id"]), 30, payment=(paid.telegram_payment_charge_id, paid.total_amount, message.date),
+    )
     await message.answer(f"🎉 <b>Оплата прошла успешно!</b>\n\n{premium_status_text(expiry)}")
 
 
@@ -431,6 +460,51 @@ async def download_import_audio(artist, title, duration, direct_url=None, skip_s
     return path, source_url, bitrate, actual_duration
 
 
+async def process_yandex_import(task, refund):
+    progress = task["progress"]
+    user_id = task["user_id"]
+    destination = "liked" if task["liked_after"] is not None else task["pending_playlist_id"]
+    args = (task["source_id"], user_id, task["artist"], task["title"], task["original_duration"],
+            destination, task["pending_position"], task["liked_after"])
+    saved = await save_yandex_import(*args)
+    if saved:
+        await refund()
+    elif task["reserved"]:
+        working_dir = UPLOADS_DIR / "yandex-import" / uuid4().hex
+        path, _, url = await download_track_smart(
+            {"artist": task["artist"], "title": task["title"], "duration": task["original_duration"]},
+            uploads_dir=working_dir, prefer_uncensored=True,
+        )
+        bitrate = duration = 0
+        if path:
+            bitrate, duration = await asyncio.to_thread(get_audio_info, Path(path))
+            if not duration or (task["original_duration"] and not duration_ok(duration, task["original_duration"])):
+                Path(path).unlink(missing_ok=True)
+                path = url = None
+                bitrate = duration = 0
+            else:
+                await asyncio.to_thread(fix_audio_tags, path, task["artist"], task["title"])
+                if task["cover_url"]:
+                    cover = await asyncio.to_thread(fetch_cover, task["cover_url"])
+                    if cover:
+                        await asyncio.to_thread(embed_cover_bytes, path, cover[0])
+        saved = await save_yandex_import(*args, audio=(path or "", url, bitrate, duration))
+        if saved["new_audio"]:
+            task["reserved"] = 0
+            await add_points(user_id, 5, "import_track")
+            progress.points += 5
+        else:
+            if path:
+                Path(path).unlink(missing_ok=True)
+            await refund()
+        if working_dir.is_dir() and not any(working_dir.iterdir()):
+            working_dir.rmdir()
+    if saved:
+        progress.track_statuses[saved["id"]] = saved["status"]
+        if saved["import_like_added"]:
+            task["liked_after"].append(saved["id"])
+
+
 async def process_task(task_data):
     user_id = task_data['user_id']
     progress = task_data['progress']
@@ -448,6 +522,20 @@ async def process_task(task_data):
         task_data['reserved'] = 0
 
     try:
+        if task_data.get("source_id"):
+            await process_yandex_import(task_data, refund_reserved)
+            return
+        if task_data.get("reuse_cached") and liked_after is None:
+            existing = await check_track_exists(artist, title)
+            if existing and existing > 0:
+                track = await get_track_by_id(existing)
+                if track:
+                    await reuse_import_track(existing, user_id, pending_playlist_id, pending_position)
+                    progress.track_statuses[existing] = track["status"]
+                    await refund_reserved()
+                    return
+            if not task_data["reserved"]:
+                return
         if liked_after is not None:
             existing = await check_track_exists(artist, title)
             if existing and existing > 0:
@@ -599,10 +687,11 @@ async def download_worker():
         await asyncio.sleep(1)
 # ============================================================
 
-def import_destination_menu(total_tracks: int) -> tuple[str, InlineKeyboardMarkup]:
+def import_destination_menu(total_tracks: int, available_tracks: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    cached = f"Уже в каталоге: {available_tracks}\n" if available_tracks else ""
     text = (
         "📦 <b>Импорт подготовлен!</b>\n"
-        f"Треков к загрузке: {total_tracks}\n\n"
+        f"Треков к загрузке: {total_tracks}\n{cached}\n"
         "👇 <b>Куда добавить эти треки?</b>"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -624,7 +713,9 @@ async def show_import_destination_menu(
     liked_tracks: list | None = None,
 ):
     reserved_count = len(tracks)
-    text, keyboard = import_destination_menu(reserved_count)
+    all_tracks = liked_tracks if liked_tracks is not None else tracks
+    cached_tracks = [track for track in all_tracks if track.get("cached_track_id")]
+    text, keyboard = import_destination_menu(reserved_count, len(cached_tracks))
     try:
         menu = await message.answer(text, reply_markup=keyboard)
     except Exception:
@@ -634,7 +725,8 @@ async def show_import_destination_menu(
     previous = pending_imports.get(user_id)
     pending_imports[user_id] = {
         "tracks": tracks,
-        "liked_tracks": liked_tracks if liked_tracks is not None else tracks,
+        "liked_tracks": all_tracks,
+        "cached_tracks": cached_tracks,
         "is_single": is_single,
         "source_type": source_type,
         "direct_url": direct_url,
@@ -697,12 +789,37 @@ async def cmd_import(message: Message, command: CommandObject) -> None:
         limit_info = await check_download_limit(int(user["id"]))
         remaining_limit = limit_info.get("remaining", 0)
 
+        if is_yandex_import_url(url):
+            await message.answer("🔎 Читаю метаданные Яндекс Музыки…")
+            tracks, _, release = await asyncio.to_thread(parse_yandex_import, url)
+            if not tracks:
+                return await message.answer("Треков не найдено.")
+            cover = await asyncio.to_thread(fetch_cover, release.cover_url) if release and release.cover_url else None
+            await save_yandex_metadata(tracks, release, cover)
+            tracks = list({track["source_id"]: track for track in tracks}.values())
+            downloadable = []
+            for track in tracks:
+                existing = await find_yandex_track(track["source_id"])
+                if existing:
+                    track["cached_track_id"] = existing["id"]
+                else:
+                    downloadable.append(track)
+            granted, quota_date = await reserve_downloads(int(user["id"]), len(downloadable))
+            await show_import_destination_menu(message, int(user["id"]), downloadable[:granted], quota_date,
+                                               source_type="yandex", liked_tracks=tracks)
+            return
+
         single_track = await asyncio.to_thread(parse_single_track, url)
         if single_track:
             try: src_type = detect_source(url)
             except ValueError: src_type = "direct"
 
-            granted, quota_date = await reserve_downloads(int(user["id"]), 1)
+            existing = await check_track_exists(single_track["artist"], single_track["title"])
+            if existing and existing > 0:
+                single_track["cached_track_id"] = existing
+                granted, quota_date = 0, None
+            else:
+                granted, quota_date = await reserve_downloads(int(user["id"]), 1)
             await show_import_destination_menu(
                 message, int(user["id"]), tracks=[single_track] if granted else [], quota_date=quota_date,
                 is_single=True, source_type=src_type, direct_url=url, liked_tracks=[single_track]
@@ -717,13 +834,13 @@ async def cmd_import(message: Message, command: CommandObject) -> None:
         
         tracks_to_import = []
         for track in tracks:
-            if remaining_limit is not None and len(tracks_to_import) >= remaining_limit:
-                break
             artist, title = track.get('artist', 'Unknown'), track.get('title', 'Unknown')
             
             existing_track_id = await check_track_exists(artist, title)
             
-            if existing_track_id is None or existing_track_id == -1:
+            if existing_track_id and existing_track_id > 0:
+                track["cached_track_id"] = existing_track_id
+            elif remaining_limit is None or len(tracks_to_import) < remaining_limit:
                 if existing_track_id == -1:
                     track['skip_soundcloud'] = True
                 tracks_to_import.append(track)
@@ -819,7 +936,7 @@ async def process_import_destination(callback: CallbackQuery):
     step = data["step"]
     if step == "destination" and action == "liked":
         return await prepare_liked_import(callback, message, user_id, data)
-    if step == "destination" and not data["tracks"] and action in {"playlists", "db_only"}:
+    if step == "destination" and not (data["tracks"] or data.get("cached_tracks")) and action in {"playlists", "db_only"}:
         return await callback.answer("Нет новых треков, доступных для скачивания.", show_alert=True)
     if step == "destination" and action == "playlists":
         playlists = {
@@ -843,7 +960,7 @@ async def process_import_destination(callback: CallbackQuery):
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
         next_step = "playlists"
     elif step == "playlists" and action == "back":
-        text, keyboard = import_destination_menu(data["reserved_count"])
+        text, keyboard = import_destination_menu(data["reserved_count"], len(data.get("cached_tracks", [])))
         next_step = "destination"
     elif step == "playlists" and action == "new":
         text = "✍️ Отправь название нового плейлиста текстовым сообщением."
@@ -944,10 +1061,12 @@ async def process_import_duplicates(callback: CallbackQuery):
 async def finish_liked_import(callback: CallbackQuery, user_id: int, data: dict, *, moved: bool = False):
     reserved = {id(track) for track in data["tracks"]}
     tracks = data["new_liked_tracks"]
-    cached = await get_cached_import_keys([import_track_key(track) for track in tracks if id(track) not in reserved])
+    cached = await get_cached_import_keys([import_track_key(track) for track in tracks
+                                           if id(track) not in reserved and not track.get("source_id")])
     if pending_imports.get(user_id) is not data:
         return await callback.answer("Меню импорта уже изменилось.", show_alert=True)
-    tracks = [track for track in tracks if id(track) in reserved or import_track_key(track) in cached]
+    tracks = [track for track in tracks if id(track) in reserved or track.get("cached_track_id")
+              or import_track_key(track) in cached]
     used = sum(id(track) in reserved for track in tracks)
     previous_step = data["step"]
     data["step"] = "starting"
@@ -967,8 +1086,10 @@ async def finish_liked_import(callback: CallbackQuery, user_id: int, data: dict,
 
 
 def import_track_key(track: dict) -> tuple[str, str]:
+    if track.get("source_id"):
+        return "yandex", track["source_id"]
     return (norm_key(normalize_artist(track.get("artist", "Unknown"))),
-            norm_key(track.get("title", "Unknown")))
+            metadata_key(track.get("title", "Unknown")))
 
 
 async def execute_import(
@@ -987,6 +1108,11 @@ async def execute_import(
     is_single = data["is_single"]
     source_type = data["source_type"]
     direct_url = data.get("direct_url")
+    playlist_reserved = None
+    if reserved is None and data.get("cached_tracks"):
+        playlist_reserved = {id(track) for track in tracks}
+        cached = {id(track) for track in data["cached_tracks"]}
+        tracks = [track for track in data["liked_tracks"] if id(track) in playlist_reserved or id(track) in cached]
     progress = ImportProgress(*data["menu"], destination, len(tracks))
     reporter = asyncio.create_task(progress.report())
     import_status_tasks.add(reporter)
@@ -1002,9 +1128,13 @@ async def execute_import(
             'pending_playlist_id': playlist_id,
             'pending_position': idx,
             'liked_after': liked_after,
-            'reserved': int(reserved is None or id(track) in reserved),
+            'reserved': int(id(track) in reserved if reserved is not None
+                            else playlist_reserved is None or id(track) in playlist_reserved),
             'quota_date': quota_date,
-            'skip_soundcloud': track.get('skip_soundcloud', False)
+            'skip_soundcloud': track.get('skip_soundcloud', False),
+            'reuse_cached': playlist_id is not None or bool(track.get("cached_track_id")),
+            'source_id': track.get("source_id"),
+            'cover_url': track["recording"][4] if track.get("source_id") else None,
         }
         
         if is_single and source_type == "soundcloud" and direct_url:
@@ -1065,7 +1195,6 @@ async def cmd_admin_panel(message: Message) -> None:
     if message.from_user.id != ADMIN_ID: return
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎧 Модерация", callback_data="admin_moderate")],
-        [InlineKeyboardButton(text="🎵 Импорт артистов", callback_data="yaimp:list")],
         [InlineKeyboardButton(text="📊 Баланс Stars", callback_data="admin_stars")],
         [InlineKeyboardButton(text="📖 Справка", callback_data="admin_help")],
     ])
@@ -1077,8 +1206,10 @@ async def process_admin_panel(callback: CallbackQuery):
     action = callback.data.split("_")[1]
     await callback.answer()
     if action == "moderate":
+        await show_moderation_menu(callback.message, edit=True)
+    elif action == "review":
         admin_user = await get_user(callback.from_user.id)
-        await _send_next_moderation_track(callback.message, int(admin_user["id"]))
+        await _send_next_moderation_track(callback.message, int(admin_user["id"]), from_menu=True)
     elif action == "stars":
         try:
             star_amount = await bot.get_my_star_balance()
@@ -1088,8 +1219,7 @@ async def process_admin_panel(callback: CallbackQuery):
         await callback.message.answer(
             "<b>Админ-команды:</b>\n"
             "<code>/admin</code>\n"
-            "<code>/moderate</code>\n"
-            "<code>/import_artist_yandex [ID или ссылка]</code> — партии импорта и модерация артистов\n"
+            "<code>/moderate</code> — обычная модерация и импорт из Яндекс Музыки\n"
             "<code>/deletetrack &lt;id&gt;</code>\n"
             "<code>/addlimit &lt;id&gt; &lt;число&gt;</code>\n"
             "<code>/resetlimit</code>\n"
@@ -1163,76 +1293,113 @@ async def cmd_deletetrack(message: Message, command: CommandObject) -> None:
     if await delete_track(int(args)): await message.answer(f"🗑️ Трек {args} удален.")
     else: await message.answer(f"❌ Трек {args} не найден.")
 
-@dp.message(Command("cache_all"))
-async def cmd_cache_all(message: Message):
-    if message.from_user.id != ADMIN_ID: return
-    
+cache_all_lock = asyncio.Lock()
+
+
+async def cache_missing_audio(chat_id: int, message: Message | None = None) -> None:
     tracks = await get_tracks_without_file_id()
     if not tracks:
-        return await message.answer("✅ Все треки уже имеют file_id. Кеширование не требуется.")
-        
-    status_msg = await message.answer(f"⏳ Начинаю обработку {len(tracks)} треков. Это займет время...")
+        if message:
+            await message.answer("✅ Все треки уже имеют file_id. Кеширование не требуется.")
+        return
+
+    status_msg = await message.answer(f"⏳ Начинаю обработку {len(tracks)} треков.") if message else None
     
     success_count = 0
     fail_count = 0
-    sent_messages = [] 
-
     for i, track in enumerate(tracks):
         file_path = Path(track["file_path"])
         if not file_path.exists():
             fail_count += 1
             continue
             
-        # 1. Проверяем/вшиваем обложку в файл (на всякий случай)
-        await asyncio.to_thread(ensure_track_has_cover, str(file_path), track["artist"], track["title"])
-        
-        # 2. ДОСТАЕМ ОБЛОЖКУ ДЛЯ ТЕЛЕГРАМА
-        cover_bytes = await asyncio.to_thread(extract_telegram_thumbnail, str(file_path))
-        thumbnail = BufferedInputFile(cover_bytes, filename="cover.jpg") if cover_bytes else None
-            
         msg = None
         try:
-            # 3. Отправляем с явным параметром thumbnail
+            if message:
+                await asyncio.to_thread(ensure_track_has_cover, str(file_path), track["artist"], track["title"])
+            cover_bytes = await asyncio.to_thread(extract_telegram_thumbnail, str(file_path))
+            thumbnail = BufferedInputFile(cover_bytes, filename="cover.jpg") if cover_bytes else None
             msg = await bot.send_audio(
-                chat_id=message.chat.id,
+                chat_id=chat_id,
                 audio=FSInputFile(file_path),
                 thumbnail=thumbnail, # <--- ГЛАВНАЯ МАГИЯ
                 title=track['title'], 
                 performer=track['artist'],
-                disable_notification=True
+                disable_notification=True,
+                request_timeout=60 if message is None else 300,
             )
             
             if msg.audio and msg.audio.file_id:
-                await set_track_file_id(track["id"], msg.audio.file_id)
+                await set_track_file_id(track["id"], msg.audio.file_id, file_path=track["file_path"])
                 success_count += 1
-                sent_messages.append(msg.message_id)
             else:
                 fail_count += 1
                 
+        except TelegramRetryAfter as exc:
+            fail_count += 1
+            await asyncio.sleep(exc.retry_after + 1)
+        except TelegramForbiddenError:
+            if not message:
+                log("Ночное кеширование пропущено: личный чат администратора недоступен.")
+                return
+            fail_count += 1
         except Exception as e:
             log(f"Ошибка кеширования трека {track['id']}: {e}")
             fail_count += 1
+        finally:
+            if msg:
+                try:
+                    await bot.delete_message(chat_id, msg.message_id, request_timeout=15)
+                except Exception as exc:
+                    log(f"Не удалось удалить служебное аудио кеширования: {exc}")
             
         await asyncio.sleep(1.5) 
         
-        if (i + 1) % 10 == 0:
+        if status_msg and (i + 1) % 10 == 0:
             try:
                 await status_msg.edit_text(f"⏳ Прогресс: {i + 1} / {len(tracks)}...\n✅ Успешно: {success_count} | ❌ Ошибок: {fail_count}")
             except: pass
             
-    # Удаляем все отправленные сообщения пачками по 100 штук в конце
-    for i in range(0, len(sent_messages), 100):
-        chunk = sent_messages[i:i+100]
+    summary = f"Кеширование завершено. Успешно: {success_count}, ошибок: {fail_count}."
+    if status_msg:
+        await status_msg.edit_text(summary)
+    else:
+        log(summary)
+
+
+@dp.message(Command("cache_all"))
+async def cmd_cache_all(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    if cache_all_lock.locked():
+        return await message.answer("Кеширование уже выполняется.")
+    async with cache_all_lock:
+        await cache_missing_audio(message.chat.id, message)
+
+
+async def nightly_cache_worker() -> None:
+    moscow = ZoneInfo("Europe/Moscow")
+    while True:
+        now = datetime.now(moscow)
+        next_run = now.replace(hour=3, minute=0, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        await asyncio.sleep((next_run - now).total_seconds())
+        if cache_all_lock.locked():
+            continue
         try:
-            await bot.delete_messages(chat_id=message.chat.id, message_ids=chunk)
-        except Exception:
-            pass
+            async with cache_all_lock:
+                await cache_missing_audio(ADMIN_ID)
+        except Exception as exc:
+            log(f"Ошибка ночного кеширования: {exc}")
 
-    await status_msg.edit_text(f"✅ <b>Обработка завершена!</b>\n\nУспешно: {success_count}\nОшибок: {fail_count}\n\nТеперь все эти треки имеют обложки и доступны в инлайн-поиске!")
-
-async def _send_next_moderation_track(message: Message, admin_internal_id: int):
+async def _send_next_moderation_track(message: Message, admin_internal_id: int, *, from_menu=False):
     tracks = await get_pending_tracks(limit=1)
-    if not tracks: return await message.answer("🎉 Очередь на модерацию пуста!")
+    if not tracks:
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="← К модерации", callback_data="admin_moderate"),
+        ]])
+        return await render_panel(message, "🎉 Очередь на модерацию пуста!", markup=markup, edit=from_menu)
     track = tracks[0]
     
     file_path = Path(track["file_path"]) if track["file_path"] else None
@@ -1325,11 +1492,20 @@ async def _send_next_moderation_track(message: Message, admin_internal_id: int):
     finally:
         if preview_path and preview_path.exists(): preview_path.unlink()
 
+async def show_moderation_menu(message: Message, *, edit=False) -> None:
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Обычная модерация", callback_data="admin_review")],
+        [InlineKeyboardButton(text="Импорт из Яндекс Музыки", callback_data="yaimp:list")],
+        [InlineKeyboardButton(text="Жалобы", callback_data="complaint:list:0")],
+    ])
+    await render_panel(message, "<b>Модерация треков</b>", markup=keyboard, edit=edit)
+
+
 @dp.message(Command("moderate"))
 async def cmd_moderate(message: Message) -> None:
-    if message.from_user.id != ADMIN_ID: return await message.answer("⛔ Нет прав.")
-    admin_user = await get_user(message.from_user.id)
-    await _send_next_moderation_track(message, int(admin_user["id"]))
+    if message.from_user.id != ADMIN_ID:
+        return await message.answer("⛔ Нет прав.")
+    await show_moderation_menu(message)
 
 @dp.callback_query(F.data.startswith("mod_"))
 async def process_moderation(callback: CallbackQuery):
@@ -1461,9 +1637,9 @@ async def process_moderation(callback: CallbackQuery):
     await callback.answer("Обрабатываю...")
     try:
         if action == "approve":
-            await update_track_status(track_id, "approved", int(admin_user["id"]))
+            published_id = await update_track_status(track_id, "approved", int(admin_user["id"]))
             new_caption = (callback.message.caption or "") + "\n\n✅ <b>ОДОБРЕНО</b>"
-            status_text = "✅ Одобрен!"
+            status_text = "✅ Одобрен!" if published_id == track_id else f"✅ Использован трек из базы #{published_id}."
         else:
             await delete_track(track_id)
             new_caption = (callback.message.caption or "") + "\n\n❌ <b>ОТКЛОНЕНО</b>"
@@ -1673,11 +1849,61 @@ async def handle_photo(message: Message) -> None:
             log(f"Ошибка сохранения обложки: {e}")
             await message.answer("❌ Ошибка при сохранении обложки. Попробуй еще раз.")
 
+async def prepare_album_import(message: Message, user_id: int, request_id: int) -> None:
+    try:
+        tracks, _, _ = await asyncio.to_thread(parse_yandex_import, message.text.strip())
+        revision, count = await album_import.prepare_request(user_id, request_id, [track["source_id"] for track in tracks])
+        if not count:
+            return await message.answer("В ссылке нет доступных для заявки записей. Ответьте на исходное сообщение другой ссылкой.")
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Начать поиск аудио", callback_data=f"album_submit:{request_id}:{revision}")
+        ]])
+        await message.answer(
+            f"Подходит треков: {count}. Можно получить до {count * album_import.REWARD} поинтов после проверки.",
+            reply_markup=markup,
+        )
+    except ValueError as exc:
+        await message.answer(esc(str(exc)[:350]))
+    except Exception as exc:
+        log(f"Ошибка чтения заявки альбома: {exc!r}")
+        await message.answer("Не удалось прочитать ссылку. Ответьте на исходное сообщение ещё раз.")
+
+
+@dp.callback_query(F.data.startswith("album_submit:"))
+async def confirm_album_import(callback: CallbackQuery) -> None:
+    if not isinstance(callback.message, Message) or callback.message.chat.type != "private":
+        return await callback.answer("Откройте заявку в личном чате с ботом.", show_alert=True)
+    _, raw_id, revision = callback.data.split(":")
+    user = await get_user(callback.from_user.id)
+    try:
+        count = await album_import.start_request(user["id"], int(raw_id), revision)
+    except ValueError as exc:
+        return await callback.answer(str(exc), show_alert=True)
+    await callback.answer()
+    await callback.message.edit_text(f"В очереди поиска {count} треков. Бот сообщит итог после модерации.")
+
+
+async def send_album_result(result: dict) -> None:
+    try:
+        await bot.send_message(
+            result["telegram_id"], f"Заявка №{result['id']} · <b>{esc(result['album_title'][:200])}</b>\n"
+            f"Одобрено: {result['approved']} из {result['total']}. Начислено поинтов: {result['points']}.",
+            request_timeout=15,
+        )
+    except TelegramForbiddenError:
+        log(f"Пользователь заявки №{result['id']} заблокировал бота.")
+
+
 @dp.message(F.text)
 async def handle_text(message: Message) -> None:
     user = await _ensure_user(message)
 
     user_id = int(user["id"])
+    reply = message.reply_to_message
+    if message.chat.type == "private" and reply and reply.from_user and reply.from_user.id == bot.id:
+        match = ALBUM_REPLY.search(reply.text or "")
+        if match:
+            return await prepare_album_import(message, user_id, int(match.group(1)))
     data = pending_imports.get(user_id)
     if data and data["step"] == "title" and data["menu"][0] == message.chat.id:
         title = message.text.strip()
@@ -1758,6 +1984,8 @@ async def handle_text(message: Message) -> None:
                 )
             return
 
+    if message.chat.type == "private" and is_yandex_import_url(message.text.strip()):
+        return await cmd_import(message, CommandObject(prefix="/", command="import", args=message.text.strip()))
     await message.answer("Я пока учусь! Используй <code>/help</code>")
 
 @dp.inline_query()
@@ -1806,7 +2034,6 @@ async def register_bot_commands() -> None:
         admin_commands = [
             BotCommand(command="admin", description="Админ-панель"),
             BotCommand(command="moderate", description="Модерация треков"),
-            BotCommand(command="import_artist_yandex", description="Импорт артиста из Яндекс Музыки и проверка аудио"),
             BotCommand(command="deletetrack", description="Удалить трек · <id трека>"),
             BotCommand(command="addlimit", description="Установить лимит · [<id пользователя>] <число>"),
             BotCommand(command="resetlimit", description="Сбросить свой счётчик скачиваний"),
@@ -1830,14 +2057,18 @@ async def main() -> None:
     asyncio.create_task(offline_purge_worker(bot))
     asyncio.create_task(premium_lifecycle_worker())
     sync_worker = asyncio.create_task(playlist_sync_worker(request_sync_download, send_sync_notice))
-    artist_worker = asyncio.create_task(artist_import_worker())
+    artist_worker = asyncio.create_task(artist_import_worker(send_album_result))
+    workers = [sync_worker, artist_worker]
+    if ADMIN_ID > 0:
+        workers.append(asyncio.create_task(nightly_cache_worker()))
+        workers.append(asyncio.create_task(admin_report.worker(bot, ADMIN_ID)))
     log("Запуск бота...")
     try:
         await dp.start_polling(bot)
     finally:
-        sync_worker.cancel()
-        artist_worker.cancel()
-        await asyncio.gather(sync_worker, artist_worker, return_exceptions=True)
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
 
 if __name__ == "__main__":
     try: asyncio.run(main())

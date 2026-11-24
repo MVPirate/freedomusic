@@ -266,6 +266,10 @@ async def sync_topic(bot, topic_id: int, sync_token: str) -> None:
 
     next_positions = {track["id"]: track["position"] for track in wanted}
     mapped = {message["track_id"]: message for message in messages}
+    updated_audio = {
+        track["id"] for track in wanted if track["id"] in mapped
+        and track["media_revision"] != mapped[track["id"]]["media_revision"]
+    }
     move_plan = json.loads(topic["move_plan"]) if topic["move_plan"] else {}
     if move_plan.get("rev") == topic["rev"]:
         moves = next_positions.keys() & move_plan["tracks"]
@@ -280,9 +284,9 @@ async def sync_topic(bot, topic_id: int, sync_token: str) -> None:
         await check_claim()
         return await bot.delete_message(chat_id, message_id)
 
-    for track_id in (mapped.keys() - next_positions.keys()) | (mapped.keys() & moves):
+    for track_id in (mapped.keys() - next_positions.keys()) | (mapped.keys() & moves) | updated_audio:
         message_id = mapped[track_id]["message_id"]
-        if track_id in moves and mapped[track_id]["position"] == next_positions[track_id]:
+        if track_id not in updated_audio and track_id in moves and mapped[track_id]["position"] == next_positions[track_id]:
             continue
         try:
             if not await pacer.call(chat_id, lambda: delete_synced_message(message_id)):
@@ -307,9 +311,10 @@ async def sync_topic(bot, topic_id: int, sync_token: str) -> None:
         if track_id in mapped:
             if mapped[track_id]["position"] != position:
                 positions.append((track_id, position))
-            continue
+            if track_id not in updated_audio:
+                continue
         message_id, file_id = await send_track(bot, chat_id, thread_id, track, check_claim)
-        await add_topic_track(topic_id, sync_token, track_id, message_id, position, file_id)
+        await add_topic_track(topic_id, sync_token, track_id, message_id, position, file_id, track["media_revision"])
         sent += 1
         moved += track_id in moves
 

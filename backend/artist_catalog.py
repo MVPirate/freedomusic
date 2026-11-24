@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import re
 import sqlite3
@@ -15,7 +16,8 @@ from urllib.parse import urlsplit, urlunsplit
 from urllib.request import urlopen
 
 from backend.artist_catalog_store import (
-    ARTIST_CATALOG_SCHEMA, CATALOG_DB_PATH, artist_credit_keys, matches_artist_page, metadata_key,
+    ARTIST_CATALOG_SCHEMA, CATALOG_DB_PATH, SAVE_RECORDING_SQL, SAVE_RELEASE_MEMBER_SQL,
+    artist_credit_keys, matches_artist_page, metadata_key,
 )
 
 
@@ -140,6 +142,23 @@ def read_source_track(item, disc: int, position: int) -> CatalogTrack:
         (getattr(item, "version", None) or "").strip(), warning, credits,
         duration if isinstance(duration, int) and duration > 0 else None,
         isrc if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{3}[0-9]{7}", isrc) else None,
+    )
+
+
+def recording_values(track: CatalogTrack, image: str | None = None) -> tuple:
+    return track.id, track.display_title, track.duration_ms, json.dumps(track.credits, ensure_ascii=False), image
+
+
+def save_recording_metadata(conn, tracks, releases):
+    images = {}
+    for release in releases:
+        if release.cover_url:
+            for track in release.tracks:
+                images.setdefault(track.id, release.cover_url)
+    conn.executemany(SAVE_RECORDING_SQL, (recording_values(track, images.get(track.id)) for track in tracks))
+    conn.executemany(
+        SAVE_RELEASE_MEMBER_SQL,
+        ((track.id, release.id, release.title, release.cover_url) for release in releases for track in release.tracks),
     )
 
 
@@ -275,11 +294,19 @@ class LocalTracks:
         self.bound_names = {row["yandex_artist_id"]: row["artist_key"] for row in confirmed_keys.values()}
         self.by_source = defaultdict(list)
         self.reviewed = defaultdict(list)
+        self.canonical = {}
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'yandex_recordings'").fetchone():
+            self.canonical = dict(conn.execute("""
+                SELECT y.source_id, y.track_id FROM yandex_recordings y
+                JOIN tracks t ON t.id = y.track_id WHERE t.status = 'approved'
+            """))
+        self.bound_tracks = set(self.canonical.values())
         if conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'artist_import_items'"
         ).fetchone():
             for row in conn.execute(APPROVED_IMPORT_LINKS_SQL):
                 self.reviewed[row["source_id"]].append(row["track_id"])
+                self.bound_tracks.add(row["track_id"])
         self.by_title = defaultdict(list)
         self.has_page = False
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(tracks)")}
@@ -290,11 +317,12 @@ class LocalTracks:
             on_page = matches_artist_page(row["artist"], self.artist_key, self.confirmed_keys)
             if external_id:
                 self.by_source[external_id].append(row)
-            if on_page:
-                self.by_title[candidate_title(row["title"])].append((row, external_id))
-                self.has_page |= row["status"] == "approved"
+            self.by_title[candidate_title(row["title"])].append((row, external_id))
+            self.has_page |= on_page and row["status"] == "approved"
 
     def match(self, track: CatalogTrack, artist_id: str) -> tuple[int | None, str]:
+        if track.id in self.canonical:
+            return self.canonical[track.id], "Подтверждённый ID Яндекс Музыки"
         reviewed = self.reviewed.get(track.id, [])
         direct = self.by_source.get(track.id, [])
         if reviewed:
@@ -307,24 +335,25 @@ class LocalTracks:
                 return direct[0]["id"], "ID Яндекс Музыки"
             return None, "проверить ID источника: " + describe_candidates(direct)
 
-        candidates = self.by_title.get(candidate_title(track.title), [])
+        expected_credit = {
+            self.artist_key if key == artist_id else self.bound_names.get(key, metadata_key(name))
+            for key, name in track.credits
+        }
+        protected_names = self.confirmed_keys | expected_credit
+        candidates = [(row, external_id) for row, external_id in self.by_title.get(candidate_title(track.title), [])
+                      if artist_credit_keys(row["artist"], protected_names) & (expected_credit | {self.artist_key})]
         if not candidates:
             return None, "нет в базе"
         if artist_id not in {key for key, _ in track.credits}:
             return None, "проверить исполнителя: " + describe_candidates(row for row, _ in candidates)
 
         # Substitute the operator-confirmed local name only for the bound ID.
-        expected_credit = {
-            self.artist_key if key == artist_id else self.bound_names.get(key, metadata_key(name))
-            for key, name in track.credits
-        }
-        protected_names = self.confirmed_keys | expected_credit
         titles = {variant for title in title_variants(track.title, track.version)
                   for variant in title_variants(title, track.warning)}
         matches = []
         unknown_duration = False
         for row, other_id in candidates:
-            if (other_id or row["status"] != "approved"
+            if (other_id or row["id"] in self.bound_tracks or row["status"] != "approved"
                     or artist_credit_keys(row["artist"], protected_names) != expected_credit):
                 continue
             if metadata_key(row["title"]) not in titles:
@@ -388,7 +417,8 @@ def inspect_releases(local: LocalTracks, artist_id: str, releases: list[Release]
     recordings = defaultdict(dict)
     for rows in matches.values():
         for track, local_id, _ in rows:
-            if local_id is not None and track.id not in local.by_source and track.id not in local.reviewed:
+            if (local_id is not None and track.id not in local.by_source
+                    and track.id not in local.reviewed and track.id not in local.canonical):
                 recordings[local_id].setdefault(track.id, set()).add(track.isrc)
     ambiguous = {}
     for local_id, source_tracks in recordings.items():
@@ -398,7 +428,8 @@ def inspect_releases(local: LocalTracks, artist_id: str, releases: list[Release]
     for album_id, rows in matches.items():
         matches[album_id] = [
             (track, None, f"местный трек #{local_id} подходит нескольким ID источника: {ambiguous[local_id]}")
-            if (local_id in ambiguous and track.id not in local.by_source and track.id not in local.reviewed)
+            if (local_id in ambiguous and track.id not in local.by_source
+                and track.id not in local.reviewed and track.id not in local.canonical)
             else (track, local_id, reason)
             for track, local_id, reason in rows
         ]

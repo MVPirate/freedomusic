@@ -17,21 +17,19 @@ from aiogram.types import (
 )
 
 from backend import artist_import as imports, database as db
-from backend.artist_catalog import parse_artist_id
+from backend.artist_catalog import DURATION_TOLERANCE_MS, parse_artist_id
 from backend.config import ADMIN_ID
+from backend.moderation_menu import render_panel
 from backend.downloader import download_from_soundcloud_url, is_soundcloud_url
 
 logger = logging.getLogger(__name__)
 PREFIX = "yaimp"
 REPLY_MARKER = re.compile(r"\nЗаявка FM #(\d+)\.(\d+)\Z")
+VERSION_MARKER = re.compile(r"\nВерсия FM #(\d+)\.(\d+)\Z")
+ARTIST_PROMPT = "Ответьте на это сообщение ссылкой на артиста Яндекс Музыки или его числовым ID.\n"
+ARTIST_PROMPT_MARKER = "Новый импорт артиста FreeDom Music"
 DRAFT = {}
 FETCHING = set()
-
-HELP = (
-    "<code>/import_artist_yandex ID_или_ссылка</code> — загрузить дискографию для предпросмотра.\n"
-    "Чтобы выбрать другое имя страницы FreeDom Music, добавьте <code>| Имя страницы</code>."
-)
-
 
 def is_admin_private(event, chat) -> bool:
     return event.from_user is not None and event.from_user.id == ADMIN_ID and chat.type == "private"
@@ -50,13 +48,18 @@ def short(text: str, size=150) -> str:
     return escape(text[:size] + ("…" if len(text) > size else ""))
 
 
-async def show_batches(message: Message) -> None:
+async def show_batches(message: Message, *, edit=False) -> None:
     jobs = await imports.batches()
     rows = [[button(job["artist_name"][:45], "status", job["id"])] for job in jobs]
-    await message.answer(
-        ("<b>Импорт артистов</b>\nВыберите партию, чтобы посмотреть ход поиска и разобрать кандидатов.\n\n"
-         if rows else "<b>Импорт артистов</b>\n\n") + HELP,
-        reply_markup=keyboard(*rows) if rows else None,
+    rows.extend([
+        [button("Новый импорт артиста", "new")],
+        [InlineKeyboardButton(text="← К модерации", callback_data="admin_moderate")],
+    ])
+    await render_panel(
+        message,
+        "<b>Импорт из Яндекс Музыки</b>\n"
+        + ("Выберите партию, чтобы посмотреть ход поиска и разобрать кандидатов." if jobs else "Партий импорта пока нет."),
+        markup=keyboard(*rows), edit=edit,
     )
 
 
@@ -72,7 +75,7 @@ async def command_import(message: Message, command: CommandObject) -> None:
     try:
         artist_id = parse_artist_id(raw_id)
     except argparse.ArgumentTypeError:
-        await message.answer("Укажите ссылку на артиста Яндекс Музыки или его числовой ID.\n\n" + HELP)
+        await message.answer("Укажите ссылку на артиста Яндекс Музыки или его числовой ID.")
         return
     admin = message.from_user.id
     if admin in FETCHING:
@@ -121,7 +124,8 @@ async def dashboard(message: Message, batch_id: int, *, edit=False) -> None:
         f"Всего записей: {sum(counts.values())}\n"
         f"В очереди: {queued} · идёт поиск: {searching}\n"
         f"На прослушивание: {found} · нужен файл: {missing}\n"
-        f"Опубликовано: {published} · уже в базе: {existing} · отклонено: {rejected}"
+        f"Опубликовано: {published} · уже в базе: {existing} · отклонено: {rejected}\n"
+        f"Не найдено для заявок альбома: {counts.get('unavailable', 0)} · отдельно: {counts.get('separate', 0)}"
     )
     if batch["waiting_for_review"]:
         text += f"\nЖдут решения в другой партии: {batch['waiting_for_review']}"
@@ -135,6 +139,10 @@ async def dashboard(message: Message, batch_id: int, *, edit=False) -> None:
                      button("Повторить поиск", "retry", batch_id)])
     if rejected:
         rows.append([button(f"Отклонённые ({rejected})", "rejected", batch_id, 0)])
+    if existing:
+        rows.append([button(f"Уже в базе ({existing})", "existing_list", batch_id, 0)])
+    if published:
+        rows.append([button(f"Опубликованные ({published})", "approved", batch_id, 0)])
     controls = [button("Обновить", "status", batch_id)]
     if batch["paused"]:
         controls.append(button("Продолжить", "resume", batch_id))
@@ -142,14 +150,7 @@ async def dashboard(message: Message, batch_id: int, *, edit=False) -> None:
         controls.append(button("Пауза", "pause", batch_id))
     rows.extend([controls, [button("Все импорты", "list")]])
     markup = keyboard(*rows)
-    if edit and message.text:
-        try:
-            await message.edit_text(text, reply_markup=markup)
-            return
-        except TelegramBadRequest as exc:
-            if "message is not modified" in str(exc).lower():
-                return
-    await message.answer(text, reply_markup=markup)
+    await render_panel(message, text, markup=markup, edit=edit)
 
 
 def format_duration(seconds: int) -> str:
@@ -167,6 +168,15 @@ async def review_card(message: Message, item: dict) -> None:
     expected = round((item["duration_ms"] or 0) / 1000)
     state = item["state"]
     rows = []
+    if item["album_request_id"]:
+        caption += f"Заявка из альбома №{item['album_request_id']}\n"
+    if state in {"existing", "approved"}:
+        next_action = "existing_list" if state == "existing" else state
+        compare = ([button("Искать аудио для сравнения", "compare", item_id, revision)],) if not item["album_request_id"] else ()
+        await message.answer(caption + f"Аудио в базе · #{item['track_id']}", reply_markup=keyboard(
+            *compare, [button("Следующий", next_action, batch_id, item_id), button("К партии", "status", batch_id)],
+        ))
+        return
     if state == "rejected":
         if await imports.duplicate_candidates(item):
             rows.append([button("Проверить трек из базы", "existing", item_id, revision)])
@@ -186,7 +196,10 @@ async def review_card(message: Message, item: dict) -> None:
         if expected and abs(actual - expected) > 2:
             caption += f"⚠️ Разница длительности {abs(actual - expected)} с. Сверьте версию.\n"
         caption += "\nПрослушайте полную запись и проверьте, есть ли запики."
-        rows.append([button("✅ Одобрить без запиков", "approve", item_id, revision)])
+        if not item["compare_existing"]:
+            rows.append([button("✅ Одобрить без запиков", "approve", item_id, revision)])
+        if not item["album_request_id"]:
+            rows.append([button("Опубликовать как отдельную версию", "separate", item_id, revision)])
         media = FSInputFile(item["file_path"], filename=f"track-{item_id}.mp3")
     else:
         reasons = {
@@ -218,7 +231,7 @@ async def review_card(message: Message, item: dict) -> None:
 async def show_next(message: Message, batch_id: int, state: str, after: int) -> None:
     item = await imports.next_review(batch_id, state, after)
     if item is None:
-        await dashboard(message, batch_id)
+        await dashboard(message, batch_id, edit=True)
     else:
         await review_card(message, item)
 
@@ -237,17 +250,40 @@ async def show_existing_track(message: Message, item_id: int, revision: int, tra
         return
 
     old = candidates[0]
+    source = short(old["source"] or "неизвестно", 50)
+    if (old["source_url"] or "").startswith(("https://", "http://")):
+        source = f'<a href="{escape(old["source_url"], quote=True)}">{source}</a>'
     text = (
         f"<b>Из базы · #{old['id']}</b>\n{short(old['artist'])} — {short(old['title'])}\n"
-        f"Длительность: {format_duration(old['duration'])}\n\n"
-        "Если это та же версия, привяжите существующий трек к релизам."
+        f"Длительность: {format_duration(old['duration'])} · {old['bitrate'] or '—'} кбит/с\n"
+        f"Источник: {source} · {short(old['quality_status'] or 'неизвестно', 40)}"
     )
-    markup = keyboard([button("Это та же версия. Привязать", "link", item_id, revision, old["id"])])
+    rows = [[button("Привязать трек из базы", "link", item_id, revision, old["id"])]]
+    if item["state"] == "found" and item["file_path"] and Path(item["file_path"]).is_file() and not item["album_request_id"]:
+        source = short(item["audio_source"], 50)
+        if (item["source_url"] or "").startswith(("https://", "http://")):
+            source = f'<a href="{escape(item["source_url"], quote=True)}">{source}</a>'
+        actual = item["duration"] or 0
+        expected = round((item["duration_ms"] or 0) / 1000)
+        duration_note = f"Длительность: {format_duration(actual)} · Яндекс: {format_duration(expected)}\n"
+        if actual and expected and abs(actual - expected) * 1000 > DURATION_TOLERANCE_MS:
+            duration_note += f"⚠️ Разница с Яндекс Музыкой — {abs(actual - expected)} с. Сверьте версию.\n"
+        await message.answer_audio(FSInputFile(item["file_path"]), caption=(
+            f"<b>Новое аудио</b>\n{short(item['artist'])} — {short(item['title'])}\n"
+            f"{duration_note}{item['bitrate']} кбит/с · Источник: {source}\n"
+            "Прослушайте обе версии и проверьте, есть ли запики."
+        ))
+        rows.append([button("Подтвердить замену аудио в существующем треке", "replace",
+                            item_id, revision, old["id"], old["media_revision"])])
+    markup = keyboard(*rows)
     path = Path(old["file_path"])
     if path.stat().st_size <= imports.MAX_AUDIO_BYTES:
         await message.answer_audio(FSInputFile(path), caption=text, reply_markup=markup)
     else:
-        await message.answer(text + "\nАудио этой записи можно открыть в WebApp.", reply_markup=markup)
+        bot = await message.bot.me()
+        rows.insert(0, [InlineKeyboardButton(text="Прослушать в Mini App",
+                                            url=f"https://t.me/{bot.username}/app?startapp=track_{old['id']}")])
+        await message.answer(text, reply_markup=keyboard(*rows))
 
 
 async def hide_buttons(message: Message) -> None:
@@ -279,13 +315,20 @@ async def action_import(callback: CallbackQuery) -> None:
             else:
                 await message.edit_text("Импорт отменён.")
         elif action == "list":
-            await show_batches(message)
+            await show_batches(message, edit=True)
+        elif action == "new":
+            await message.answer(
+                ARTIST_PROMPT + "Для другого имени страницы добавьте <code>| Имя страницы</code>.\n"
+                + ARTIST_PROMPT_MARKER, reply_markup=ForceReply(),
+            )
         elif action == "status":
             await dashboard(message, int(args[0]), edit=True)
         elif action in {"pause", "resume", "retry"}:
             await imports.control_batch(int(args[0]), action)
             await dashboard(message, int(args[0]), edit=True)
-        elif action in {"found", "missing", "rejected"}:
+        elif action in {"found", "missing", "rejected", "existing_list", "approved"}:
+            if action == "existing_list":
+                action = "existing"
             await show_next(message, int(args[0]), action, int(args[1]))
         elif action == "existing":
             await show_existing_track(message, int(args[0]), int(args[1]), int(args[2]) if len(args) == 3 else None)
@@ -294,18 +337,35 @@ async def action_import(callback: CallbackQuery) -> None:
             await hide_buttons(message)
             await message.answer("Поставил поиск другой версии на Hitmo в очередь.")
             await dashboard(message, batch_id)
-        elif action in {"approve", "reject", "link"}:
+        elif action == "compare":
+            batch_id = await imports.queue_comparison(int(args[0]), int(args[1]))
+            await hide_buttons(message)
+            await message.answer("Поставил поиск аудио для сравнения в очередь.")
+            await dashboard(message, batch_id)
+        elif action == "separate":
+            item = await imports.get_item(int(args[0]))
+            if not item or item["attempt"] != int(args[1]) or item["state"] != "found" or item["album_request_id"]:
+                raise ValueError("Заявка уже изменилась. Откройте её заново.")
+            await message.answer(
+                "Ответьте названием версии, например Live или Acoustic. Бот добавит его к названию трека "
+                "и опубликует отдельную запись."
+                f"\nВерсия FM #{item['id']}.{item['attempt']}", reply_markup=ForceReply(),
+            )
+        elif action in {"approve", "reject", "link", "replace"}:
             user = await db.get_user(admin)
             if not user:
                 await message.answer("Сначала зарегистрируйтесь командой /start.")
                 return
             item = await imports.review(int(args[0]), int(args[1]), action != "reject", int(user["id"]),
-                                        existing_track_id=int(args[2]) if action == "link" else None)
+                                        existing_track_id=int(args[2]) if action in {"link", "replace"} else None,
+                                        media_revision=int(args[3]) if action == "replace" else None)
             await hide_buttons(message)
-            if item["reused"]:
+            if item["replaced"]:
+                await message.answer("Аудио в существующем треке заменено.")
+            elif item["reused"]:
                 await message.answer("Трек из базы привязан к релизам.")
             else:
-                await message.answer("Трек опубликован." if action == "approve" else "Запись отклонена.")
+                await message.answer("Трек опубликован." if action != "reject" else "Запись отклонена.")
             await show_next(message, item["batch_id"], item["state"], item["id"])
         elif action == "manual":
             item = await imports.get_item(int(args[0]))
@@ -321,17 +381,40 @@ async def action_import(callback: CallbackQuery) -> None:
         await message.answer(short(str(exc), 350))
     except Exception:
         logger.exception("Ошибка в меню импорта артиста")
-        await message.answer("Не удалось выполнить действие. Откройте партию повторно через /import_artist_yandex.")
+        await message.answer("Не удалось выполнить действие. Откройте партию повторно через /moderate.")
+
+
+def is_artist_prompt_reply(message: Message) -> bool:
+    reply = message.reply_to_message
+    return bool(is_admin_private(message, message.chat) and message.text and reply and reply.from_user
+                and reply.from_user.id == message.bot.id
+                and (reply.text or "").endswith("\n" + ARTIST_PROMPT_MARKER))
+
+
+async def handle_artist_prompt_reply(message: Message) -> None:
+    await command_import(message, CommandObject(prefix="/", command="import_artist_yandex", args=message.text))
 
 
 def is_import_reply(message: Message) -> bool:
     reply = message.reply_to_message
     return bool(is_admin_private(message, message.chat) and reply and reply.from_user
-                and reply.from_user.id == message.bot.id and REPLY_MARKER.search(reply.text or "")
-                and (message.audio or message.document or message.text))
+                and reply.from_user.id == message.bot.id
+                and ((VERSION_MARKER.search(reply.text or "") and message.text)
+                     or (REPLY_MARKER.search(reply.text or "") and (message.audio or message.document or message.text))))
 
 
 async def handle_import_reply(message: Message) -> None:
+    version = VERSION_MARKER.search(message.reply_to_message.text)
+    if version:
+        user = await db.get_user(message.from_user.id)
+        try:
+            item = await imports.review(*map(int, version.groups()), True, user["id"], version_label=message.text)
+        except ValueError as exc:
+            await message.answer(short(str(exc), 350))
+            return
+        await message.answer(f"Опубликована отдельная версия «{short(item['title'])}».")
+        await dashboard(message, item["batch_id"])
+        return
     match = REPLY_MARKER.search(message.reply_to_message.text)
     item_id, revision = map(int, match.groups())
     item = await imports.get_item(item_id)
@@ -381,5 +464,6 @@ async def handle_import_reply(message: Message) -> None:
 
 def register(dispatcher: Dispatcher) -> None:
     dispatcher.message.register(command_import, Command("import_artist_yandex"))
+    dispatcher.message.register(handle_artist_prompt_reply, is_artist_prompt_reply)
     dispatcher.message.register(handle_import_reply, is_import_reply)
     dispatcher.callback_query.register(action_import, F.data.startswith(PREFIX + ":"))

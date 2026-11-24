@@ -45,7 +45,7 @@ from backend.database import (
     get_level_progress, set_playlist_price, get_market_playlists, buy_playlist,
     clear_user_likes, clear_user_playlist, delete_user_playlist, remove_playlist_from_market,
     toggle_like, get_user_liked_tracks, get_user_liked_track_ids, get_user_stats,
-    report_track, remove_track_from_playlist, get_playlist_by_id,
+    remove_track_from_playlist, get_playlist_by_id,
     set_playlist_custom_cover, get_similar_artists, get_trending_tracks,
     get_trending_artists, get_artist_tracks, get_artist_albums, get_artist_album, get_artist_album_cover,
     get_track_artist_pages,
@@ -62,6 +62,8 @@ from backend.database import (
 )
 from backend.import_messages import PLAYLIST_IMPORT_INSTRUCTIONS
 from backend import playlist_sync
+from backend import album_import
+from backend import complaints
 from backend.playlist_media import TRAILER_MAX_BYTES, upload_playlist_trailer
 
 # --- НОВЫЙ ИМПОРТ ДЛЯ FFMPEG/SOUNDCLOUD ---
@@ -447,6 +449,24 @@ async def api_get_artist_album_cover(album_id: str, artist: str = Query(min_leng
     data, mime = image
     return Response(content=data, media_type=mime, headers={"Cache-Control": "public, max-age=3600"})
 
+
+@app.post("/api/artist_albums/{album_id}/contributions", status_code=201)
+async def api_create_album_contribution(album_id: str, request: Request, artist: str = Query(min_length=1),
+                                        user: dict = Depends(current_user)):
+    init_data = request.headers.get("Authorization", "")
+    if not init_data.startswith("TWA "):
+        raise HTTPException(401, "Откройте альбом в Telegram.")
+    session = safe_parse_webapp_init_data(token=TELEGRAM_BOT_TOKEN, init_data=init_data[4:])
+    if not 0 <= time.time() - session.auth_date.timestamp() < 86400:
+        raise HTTPException(401, "Откройте Mini App заново.")
+    try:
+        code = await album_import.create_request(user["id"], artist, album_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"start": f"album_{code}"}
+
 @app.post("/api/download/{track_id}")
 async def api_download(track_id: int, request: Request):
     tg_id = await get_tg_user_id(request)
@@ -493,7 +513,7 @@ async def api_download(track_id: int, request: Request):
         )
         
         if msg.audio and msg.audio.file_id:
-            await set_track_file_id(track["id"], msg.audio.file_id)
+            await set_track_file_id(track["id"], msg.audio.file_id, file_path=track["file_path"])
         
     if not limit_info["is_premium"]:
         await increment_download_count(int(user["id"]), 1)
@@ -512,13 +532,15 @@ async def api_cover(track_id: int):
 
     cache_dir = Path("uploads/covers")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cached_jpg = cache_dir / f"track_{track_id}.jpg"
-    cached_png = cache_dir / f"track_{track_id}.png"
+    cache_key = hashlib.sha256((track["file_path"] or "").encode()).hexdigest()[:20]
+    cached_jpg = cache_dir / f"track_{track_id}_{cache_key}.jpg"
+    cached_png = cache_dir / f"track_{track_id}_{cache_key}.png"
+    headers = {"Cache-Control": "no-store"}
     
     if cached_jpg.exists():
-        return FileResponse(cached_jpg, media_type="image/jpeg")
+        return FileResponse(cached_jpg, media_type="image/jpeg", headers=headers)
     if cached_png.exists():
-        return FileResponse(cached_png, media_type="image/png")
+        return FileResponse(cached_png, media_type="image/png", headers=headers)
     
     file_path = Path(track["file_path"])
     if not file_path.exists(): return RedirectResponse(url=fallback_url)
@@ -549,7 +571,7 @@ async def api_cover(track_id: int):
             else:
                 cached_jpg.write_bytes(cover_data)
                 
-            return Response(content=cover_data, media_type=mime_type)
+            return Response(content=cover_data, media_type=mime_type, headers=headers)
             
     except Exception as e:
         logger.error(f"Ошибка получения обложки: {e}")
@@ -703,10 +725,24 @@ async def api_remove_track_from_playlist(playlist_id: int, track_id: int, pl: di
     await remove_track_from_playlist(pl["id"], track_id)
     return {"ok": True, "msg": "Трек удален из плейлиста"}
 
+class TrackComplaint(BaseModel):
+    reason: str = Field(max_length=24)
+    reference_url: str = Field(max_length=500)
+
+
 @app.post("/api/track/report/{track_id}")
-async def api_report_track(track_id: int):
-    await report_track(track_id)
-    return {"ok": True, "msg": "Жалоба отправлена. Спасибо, что помогаете бороться с цензурой!"}
+async def api_report_track(track_id: int, body: TrackComplaint, request: Request):
+    telegram = get_tg_user(request)
+    if telegram is None:
+        raise HTTPException(401, "Откройте Mini App через Telegram.")
+    user = await get_user(telegram.id)
+    try:
+        created = await complaints.submit(track_id, user, telegram.username, body.reason, body.reference_url)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True, "msg": "Жалоба отправлена." if created else "Ваша жалоба на этот трек уже на проверке."}
 
 @app.post("/api/playlists/{playlist_id}/request_trailer")
 async def api_request_trailer(playlist_id: int, request: Request, pl: dict = Depends(owned_playlist)):
