@@ -1,4 +1,4 @@
-from fastapi import Body, FastAPI, Request, Depends, HTTPException
+from fastapi import Body, FastAPI, Request, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse, FileResponse, Response, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -47,7 +47,9 @@ from backend.database import (
     toggle_like, get_user_liked_tracks, get_user_liked_track_ids, get_user_stats,
     report_track, remove_track_from_playlist, get_playlist_by_id,
     set_playlist_custom_cover, get_similar_artists, get_trending_tracks,
-    get_trending_artists, get_artist_tracks, set_track_file_id,
+    get_trending_artists, get_artist_tracks, get_artist_albums, get_artist_album, get_artist_album_cover,
+    get_track_artist_pages,
+    set_track_file_id,
     update_user_settings, buy_theme,
     get_wave_recommendations,
     is_premium_active, parse_premium_expiry, get_pending_tracks, update_track_status, delete_track, get_admin_stats,
@@ -273,6 +275,7 @@ async def api_search(request: Request, response: Response):
     if not query: return {"error": "Пустой запрос"}
         
     tracks = await search_tracks(query, limit=10)
+    artist_pages = await get_track_artist_pages(tracks)
     
     tg_id = await get_tg_user_id(request)
     liked_ids = []
@@ -285,14 +288,15 @@ async def api_search(request: Request, response: Response):
     result = []
     for t in tracks:
         quality = t["quality_status"] if t["quality_status"] != 'none' else 'Verified'
+        pages = artist_pages[t["id"]]
         result.append({
             "id": t["id"], "artist": t["artist"], "title": t["title"], "quality": quality,
-            "is_liked": t["id"] in liked_ids
+            "is_liked": t["id"] in liked_ids, "page_artists": pages, "page_artist": pages[0] if pages else "",
         })
         
     similar_artists = []
-    if result:
-        main_artist = result[0]["artist"].split(",")[0].strip()
+    if result and result[0]["page_artist"]:
+        main_artist = result[0]["page_artist"]
         similar_artists = await get_similar_artists(main_artist, limit=5)
         
     return {"tracks": add_stream_links(result, user, response), "similar_artists": similar_artists}
@@ -377,29 +381,71 @@ async def api_get_wave(request: Request, response: Response):
         
     return {"tracks": add_stream_links(result, user, response)}
 
-@app.get("/api/artist_tracks")
-async def api_get_artist_tracks(request: Request, response: Response):
-    artist = request.query_params.get("artist", "").strip()
-    if not artist: return {"error": "Пустой запрос"}
-    
-    tracks, artist_profile = await get_artist_tracks(artist)
-    
+async def artist_stream_tracks(tracks: list[dict], request: Request, response: Response) -> list[dict]:
     tg_id = await get_tg_user_id(request)
-    liked_ids = []
-    user = None
-    if tg_id:
-        user = await get_user(tg_id)
-        if user:
-            liked_ids = await get_user_liked_track_ids(int(user["id"]))
+    user = await get_user(tg_id) if tg_id else None
+    liked_ids = set(await get_user_liked_track_ids(int(user["id"]))) if user else set()
+    return add_stream_links([
+        {
+            "id": track["id"], "artist": track["artist"], "title": track["title"],
+            "quality": track["quality_status"] if track["quality_status"] not in (None, "none") else "Verified",
+            "is_liked": track["id"] in liked_ids,
+        }
+        for track in tracks
+    ], user, response)
 
-    result = []
-    for t in tracks:
-        quality = t["quality_status"] if t["quality_status"] != 'none' else 'Verified'
-        result.append({
-            "id": t["id"], "artist": t["artist"], "title": t["title"], "quality": quality,
-            "is_liked": t["id"] in liked_ids
-        })
-    return {"tracks": add_stream_links(result, user, response), "profile": artist_profile}
+
+@app.get("/api/artist_tracks")
+async def api_get_artist_tracks(
+    request: Request, response: Response, artist: str = "",
+    limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0, le=2**63 - 1),
+):
+    if not artist.strip():
+        return {"error": "Пустой запрос"}
+    tracks, profile = await get_artist_tracks(artist, limit=limit, offset=offset)
+    total = profile["track_count"]
+    next_offset = offset + len(tracks)
+    return {
+        "tracks": await artist_stream_tracks(tracks, request, response),
+        "profile": profile,
+        "total": total,
+        "next_offset": next_offset if next_offset < total else None,
+    }
+
+
+@app.get("/api/artist_albums")
+async def api_get_artist_albums(artist: str = Query(min_length=1)):
+    return {"albums": await get_artist_albums(artist)}
+
+
+@app.get("/api/artist_albums/{album_id}")
+async def api_get_artist_album(album_id: str, request: Request, response: Response,
+                               artist: str = Query(min_length=1)):
+    album = await get_artist_album(artist, album_id)
+    if album is None:
+        raise HTTPException(404, "Релиз не найден.")
+    rows = album["tracks"]
+    available = await artist_stream_tracks([
+        {"id": row["id"], "title": row["local_title"], "artist": row["local_artist"],
+         "quality_status": row["quality_status"]}
+        for row in rows if row["id"] is not None
+    ], request, response)
+    by_id = {track["id"]: track for track in available}
+    album["tracks"] = [
+        dict(disc=row["disc"], position=row["position"], title=row["title"], artist=row["artist"],
+             duration_ms=row["duration_ms"], track=by_id.get(row["id"]))
+        for row in rows
+    ]
+    return {"album": album}
+
+
+@app.get("/api/artist_albums/{album_id}/cover")
+async def api_get_artist_album_cover(album_id: str, artist: str = Query(min_length=1)):
+    image = await get_artist_album_cover(artist, album_id)
+    if image is None:
+        raise HTTPException(404, "Обложка не найдена.")
+    data, mime = image
+    return Response(content=data, media_type=mime, headers={"Cache-Control": "public, max-age=3600"})
 
 @app.post("/api/download/{track_id}")
 async def api_download(track_id: int, request: Request):

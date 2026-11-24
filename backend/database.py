@@ -13,10 +13,11 @@ from contextlib import asynccontextmanager
 from uuid import uuid4
 import aiosqlite
 
+from backend.artist_catalog_store import ARTIST_CATALOG_SCHEMA, ARTIST_IMPORT_SCHEMA, CATALOG_DB_PATH
+from backend.artist_catalog_store import matches_artist_page, metadata_key, split_artist_credits
 from backend.config import ADMIN_ID
 
-DB_DIR: str = os.path.dirname(os.path.abspath(__file__))
-DB_PATH: str = os.path.join(DB_DIR, "music_bot.db")
+DB_PATH: str = str(CATALOG_DB_PATH)
 LIKED_PLAYLIST_TITLE = "❤️ Мне нравится"
 TOPIC_LEASE_SECONDS = 60
 PROFILE_DECORATIONS = {
@@ -185,6 +186,8 @@ async def get_db():
 async def init_mini_app_schema() -> None:
     async with get_db() as conn:
         await conn.executescript(MINI_APP_SCHEMA)
+        await conn.executescript(ARTIST_CATALOG_SCHEMA)
+        await conn.executescript(ARTIST_IMPORT_SCHEMA)
         await conn.execute("BEGIN IMMEDIATE")
         async with conn.execute("PRAGMA table_info(playlist_sync_tracks)") as cursor:
             columns = {row["name"] for row in await cursor.fetchall()}
@@ -1544,63 +1547,148 @@ async def get_artist_cover(name: str) -> bytes | None:
 
 
 async def set_artist_cover(name: str, jpeg: bytes) -> bool:
-    key = artist_cover_key(name)
+    cover_key = artist_cover_key(name)
     async with get_db() as conn:
-        async with conn.execute("SELECT DISTINCT artist FROM tracks WHERE status = 'approved'") as cursor:
-            artists = await cursor.fetchall()
-        if not any(artist_cover_key(row["artist"]) == key for row in artists):
+        key = metadata_key(name)
+        await _bind_artist_page_filter(conn, key)
+        async with conn.execute(f"SELECT 1 FROM tracks WHERE {ARTIST_PAGE_FILTER} LIMIT 1", (key,)) as cursor:
+            found = await cursor.fetchone() is not None
+        if not found:
+            async with conn.execute("SELECT DISTINCT artist FROM tracks WHERE status = 'approved'") as cursor:
+                found = any(artist_cover_key(row["artist"]) == cover_key for row in await cursor.fetchall())
+        if not found:
             return False
         await conn.execute(
             """INSERT INTO artist_covers (artist_key, jpeg) VALUES (?, ?)
-               ON CONFLICT(artist_key) DO UPDATE SET jpeg = excluded.jpeg""", (key, jpeg),
+               ON CONFLICT(artist_key) DO UPDATE SET jpeg = excluded.jpeg""", (cover_key, jpeg),
         )
         await conn.commit()
         return True
 
 
+TRACK_INTERACTIONS_SQL = """
+    , track_likes AS (
+        SELECT l.track_id, COUNT(DISTINCT l.user_id) AS total
+        FROM likes l JOIN eligible_tracks t ON t.id = l.track_id
+        GROUP BY l.track_id
+    ), track_saves AS (
+        SELECT pt.track_id, COUNT(DISTINCT p.user_id) AS total
+        FROM eligible_tracks t
+        JOIN playlist_tracks pt ON pt.track_id = t.id
+        JOIN user_playlists p ON p.id = pt.playlist_id
+        WHERE p.is_system = 0
+        GROUP BY pt.track_id
+    ), ranked_tracks AS (
+        SELECT t.*, COALESCE(t.download_count, 0) + COALESCE(l.total, 0)
+                      + COALESCE(s.total, 0) AS interactions
+        FROM eligible_tracks t
+        LEFT JOIN track_likes l ON l.track_id = t.id
+        LEFT JOIN track_saves s ON s.track_id = t.id
+    )
+"""
+
+
+async def _read_confirmed_artist_names(conn: aiosqlite.Connection) -> dict[str, str]:
+    async with conn.execute("SELECT artist_key, artist_name FROM artist_catalog_bindings") as cursor:
+        return {row["artist_key"]: row["artist_name"] for row in await cursor.fetchall()}
+
+
+IMPORTED_ARTIST_CREDITS_SQL = """
+    SELECT i.track_id, i.artist,
+           CASE WHEN i.credited = 1 THEN a.artist_key END AS bound_key,
+           CASE WHEN i.credited = 1 THEN a.artist_name END AS bound_name
+    FROM artist_import_items i
+    JOIN artist_import_batches b ON b.id = i.batch_id
+    JOIN artist_catalog_bindings a ON a.artist_key = b.artist_key
+    WHERE i.track_id IS NOT NULL AND i.state IN ('approved', 'existing')
+"""
+
+ARTIST_PAGE_FILTER = f"""status = 'approved' AND (on_artist_page(artist) OR id IN (
+    SELECT track_id FROM ({IMPORTED_ARTIST_CREDITS_SQL}) WHERE bound_key = ? OR on_artist_page(artist)
+))"""
+
+
+async def _bind_artist_page_filter(conn: aiosqlite.Connection, key: str) -> dict[str, str]:
+    names = await _read_confirmed_artist_names(conn)
+    await conn.create_function(
+        "on_artist_page", 1, lambda credit: matches_artist_page(credit, key, names), deterministic=True,
+    )
+    return names
+
+
+async def _read_imported_artist_credits(
+    conn: aiosqlite.Connection, track_ids: list[int] | None = None,
+) -> dict[int, list[str]]:
+    query = IMPORTED_ARTIST_CREDITS_SQL
+    if track_ids is not None:
+        if not track_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in track_ids)
+        query += f" AND i.track_id IN ({placeholders})"
+    result: dict[int, list[str]] = {}
+    async with conn.execute(query + " ORDER BY i.id", track_ids or []) as cursor:
+        async for row in cursor:
+            credits = result.setdefault(row["track_id"], [])
+            credits.append(row["artist"])
+            if row["bound_name"]:
+                credits.append(row["bound_name"])
+    return result
+
+
+def _artist_page_names(credits: list[str], confirmed_names: dict[str, str]) -> list[str]:
+    pages = {}
+    for credit in credits:
+        for name in split_artist_credits(credit, confirmed_names):
+            key = metadata_key(name)
+            pages.setdefault(key, confirmed_names.get(key, name))
+    return list(pages.values())
+
+
+async def get_track_artist_pages(tracks: list[dict]) -> dict[int, list[str]]:
+    if not tracks:
+        return {}
+    async with get_db() as conn:
+        names = await _read_confirmed_artist_names(conn)
+        imported = await _read_imported_artist_credits(conn, [track["id"] for track in tracks])
+    return {track["id"]: _artist_page_names([track["artist"], *imported.get(track["id"], [])], names)
+            for track in tracks}
+
+
 async def get_trending_artists(limit: int | None = 6) -> list[dict[str, Any]]:
     async with get_db() as conn:
         async with conn.execute(
-            """WITH track_likes AS (
-                   SELECT track_id, COUNT(*) AS total FROM likes GROUP BY track_id
-               ), track_saves AS (
-                   SELECT pt.track_id, COUNT(DISTINCT p.user_id) AS total
-                   FROM playlist_tracks pt JOIN user_playlists p ON p.id = pt.playlist_id
-                   WHERE p.is_system = 0
-                   GROUP BY pt.track_id
-               )
-               SELECT t.id, t.artist, COALESCE(t.download_count, 0) AS downloads,
-                      COALESCE(l.total, 0) AS likes, COALESCE(s.total, 0) AS saves
-               FROM tracks t
-               LEFT JOIN track_likes l ON l.track_id = t.id
-               LEFT JOIN track_saves s ON s.track_id = t.id
-               WHERE t.status = 'approved'
-               ORDER BY t.created_at DESC, t.id DESC"""
+            """WITH eligible_tracks AS (
+                   SELECT id, artist, download_count, created_at FROM tracks WHERE status = 'approved'
+               )""" + TRACK_INTERACTIONS_SQL + """
+               SELECT id, artist, COALESCE(download_count, 0) AS downloads, interactions
+               FROM ranked_tracks ORDER BY created_at DESC, id DESC"""
         ) as cursor:
             all_tracks = await cursor.fetchall()
         async with conn.execute("SELECT artist_key FROM artist_covers") as cursor:
             custom_covers = {row["artist_key"] for row in await cursor.fetchall()}
+        confirmed_names = await _read_confirmed_artist_names(conn)
+        imported = await _read_imported_artist_credits(conn)
 
     unnamed = {"", "unknown", "unknown artist", "неизвестно", "неизвестный исполнитель", "various artists", "разные исполнители"}
     artist_stats = {}
     for t in all_tracks:
-        name = normalize_artist(t["artist"])
-        key = name.casefold()
-        if key in unnamed:
-            continue
-        if key not in artist_stats:
-            artist_stats[key] = {
-                "artist": name,
-                "total_downloads": 0,
-                "interactions": 0,
-                "track_count": 0,
-                "latest_track_id": t["id"],
-                "has_custom_cover": key in custom_covers,
-            }
-        stats = artist_stats[key]
-        stats["total_downloads"] += t["downloads"]
-        stats["interactions"] += t["downloads"] + t["likes"] + t["saves"]
-        stats["track_count"] += 1
+        for name in _artist_page_names([t["artist"], *imported.get(t["id"], [])], confirmed_names):
+            key = metadata_key(name)
+            if key in unnamed:
+                continue
+            if key not in artist_stats:
+                artist_stats[key] = {
+                    "artist": name,
+                    "total_downloads": 0,
+                    "interactions": 0,
+                    "track_count": 0,
+                    "latest_track_id": t["id"],
+                    "has_custom_cover": artist_cover_key(name) in custom_covers,
+                }
+            stats = artist_stats[key]
+            stats["total_downloads"] += t["downloads"]
+            stats["interactions"] += t["interactions"]
+            stats["track_count"] += 1
 
     sorted_artists = sorted(
         artist_stats.values(),
@@ -1608,27 +1696,84 @@ async def get_trending_artists(limit: int | None = 6) -> list[dict[str, Any]]:
     )
     return sorted_artists[:limit]
 
-async def get_artist_tracks(artist_name: str, limit: int = 20) -> tuple[list[dict], dict]:
-    target_norm = artist_cover_key(artist_name)
-    
+async def get_artist_tracks(artist_name: str, limit: int = 20, offset: int = 0) -> tuple[list[dict], dict]:
+    key = metadata_key(artist_name)
     async with get_db() as conn:
-        async with conn.execute("SELECT * FROM tracks WHERE status = 'approved'") as cursor:
-            all_tracks = await cursor.fetchall()
-            
-        matching_tracks = []
-        for t in all_tracks:
-            if artist_cover_key(t["artist"]) == target_norm:
-                matching_tracks.append(dict(t))
-                
-        latest = max(matching_tracks, key=lambda track: (track["created_at"] or "", track["id"]), default=None)
-        async with conn.execute("SELECT 1 FROM artist_covers WHERE artist_key = ?", (target_norm,)) as cursor:
+        await conn.execute("BEGIN")
+        confirmed_names = await _bind_artist_page_filter(conn, key)
+        async with conn.execute(
+            f"""SELECT COUNT(*) OVER () AS total, id
+                FROM tracks WHERE {ARTIST_PAGE_FILTER} ORDER BY created_at DESC, id DESC LIMIT 1""", (key,)
+        ) as cursor:
+            latest = await cursor.fetchone()
+        async with conn.execute("SELECT 1 FROM artist_covers WHERE artist_key = ?",
+                                (artist_cover_key(artist_name),)) as cursor:
             has_custom_cover = await cursor.fetchone() is not None
-    matching_tracks.sort(key=lambda track: track["download_count"] or 0, reverse=True)
-    return matching_tracks[:limit], {
-        "artist": normalize_artist(artist_name),
+        async with conn.execute(
+            f"""WITH eligible_tracks AS (
+                    SELECT id, artist, title, quality_status, download_count, created_at
+                    FROM tracks WHERE {ARTIST_PAGE_FILTER}
+                )""" + TRACK_INTERACTIONS_SQL + """
+                SELECT id, artist, title, quality_status FROM ranked_tracks
+                ORDER BY interactions DESC, created_at DESC, id DESC LIMIT ? OFFSET ?""",
+            (key, limit, offset),
+        ) as cursor:
+            tracks = [dict(row) for row in await cursor.fetchall()]
+    return tracks, {
+        "artist": confirmed_names.get(key, artist_name.strip()),
         "latest_track_id": latest["id"] if latest else None,
         "has_custom_cover": has_custom_cover,
+        "track_count": latest["total"] if latest else 0,
     }
+
+
+async def get_artist_albums(artist_name: str) -> list[dict]:
+    async with get_db() as conn:
+        async with conn.execute(
+            """SELECT a.album_id, a.title, a.year, a.release_type, a.cover IS NOT NULL AS has_cover,
+                      COUNT(e.position) AS track_count, COUNT(t.id) AS available_count
+               FROM artist_catalog_albums a
+               LEFT JOIN artist_catalog_tracks e ON e.artist_key = a.artist_key AND e.album_id = a.album_id
+               LEFT JOIN tracks t ON t.id = e.track_id AND t.status = 'approved'
+               WHERE a.artist_key = ?
+               GROUP BY a.artist_key, a.album_id
+               ORDER BY a.year DESC, a.title COLLATE NOCASE, a.album_id""",
+            (metadata_key(artist_name),),
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+
+async def get_artist_album(artist_name: str, album_id: str) -> dict | None:
+    params = (metadata_key(artist_name), album_id)
+    async with get_db() as conn:
+        await conn.execute("BEGIN")
+        async with conn.execute(
+            """SELECT album_id, title, year, release_type, cover IS NOT NULL AS has_cover
+               FROM artist_catalog_albums WHERE artist_key = ? AND album_id = ?""", params
+        ) as cursor:
+            album = await cursor.fetchone()
+        if album is None:
+            return None
+        async with conn.execute(
+            """SELECT e.disc, e.position, e.title, e.artist, e.duration_ms,
+                      t.id, t.title AS local_title, t.artist AS local_artist, t.quality_status
+               FROM artist_catalog_tracks e
+               LEFT JOIN tracks t ON t.id = e.track_id AND t.status = 'approved'
+               WHERE e.artist_key = ? AND e.album_id = ?
+               ORDER BY e.disc, e.position""", params
+        ) as cursor:
+            return dict(album, tracks=[dict(row) for row in await cursor.fetchall()])
+
+
+async def get_artist_album_cover(artist_name: str, album_id: str) -> tuple[bytes, str] | None:
+    async with get_db() as conn:
+        async with conn.execute(
+            """SELECT cover, cover_mime FROM artist_catalog_albums
+               WHERE artist_key = ? AND album_id = ? AND cover IS NOT NULL""",
+            (metadata_key(artist_name), album_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return (row["cover"], row["cover_mime"]) if row else None
 
 async def set_track_file_id(track_id: int, file_id: str) -> None:
     async with get_db() as conn:

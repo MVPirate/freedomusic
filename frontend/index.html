@@ -2358,6 +2358,39 @@ body[data-theme="blue"] .bottom-nav { background: rgba(13, 20, 36, .96); }
 }
 .new-artist-card.has-long-name .new-artist-name { font-size: 12px; }
 .artist-header .ui-button { margin-top: 12px; }
+.artist-tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+.artist-tabs [aria-pressed="true"] { border-color: var(--blue); color: var(--blue); }
+.artist-message { margin: 14px 0; color: var(--text-muted); }
+.artist-message:empty { display: none; }
+.artist-page-more { display: block; margin: 12px auto 0; }
+.artist-album-group { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 12px; }
+.artist-album-group + h3 { margin-top: 20px; }
+.artist-album-card {
+  display: grid; justify-content: stretch; align-content: start;
+  gap: 5px; min-width: 0; text-align: left; padding: 8px; border-radius: 14px;
+}
+.artist-album-art {
+  display: grid; place-items: center; aspect-ratio: 1; overflow: hidden; border-radius: 9px;
+  color: var(--text-muted); background: var(--card-hover); font-size: 26px;
+}
+.artist-album-art img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.artist-album-title { overflow-wrap: anywhere; }
+.artist-album-meta { color: var(--text-muted); font-size: 12px; }
+.artist-album-heading { margin: 10px 0 4px; overflow-wrap: anywhere; }
+.artist-disc-heading { margin: 12px 0 4px; color: var(--text-muted); font-size: 13px; }
+.artist-track-number { flex: 0 0 22px; text-align: center; color: var(--text-muted); font-size: 12px; }
+.artist-track-main .track-title, .artist-track-main .track-artist,
+.artist-track-unavailable .track-title, .artist-track-unavailable .track-artist { display: block; }
+button.artist-track-main, .search-artist-link {
+  border: 0; padding: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.search-artist-link {
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; pointer-events: auto;
+  vertical-align: bottom;
+}
+.track-artist.search-artist-links { white-space: normal; }
+.search-artist-link:hover, .search-artist-link:focus-visible { color: var(--blue); text-decoration: underline; }
+.artist-track-unavailable .track-main { cursor: default; color: var(--text-muted); }
 .new-playlist-card-sub, .new-market-card-seller, .new-market-card-stats { color: var(--text-muted); }
 .new-playlist-card-menu { border: 0; padding: 0; }
 .market-filters { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
@@ -2617,7 +2650,19 @@ body[data-theme="blue"] .bottom-nav { background: rgba(13, 20, 36, .96); }
       <button id="artist-cover-button" class="ui-button" type="button" onclick="document.getElementById('artist-cover-file').click()" hidden>Сменить обложку</button>
       <input id="artist-cover-file" type="file" accept="image/jpeg,image/png,image/webp" onchange="uploadArtistCover(this)" hidden>
     </div>
-    <div id="artist-tracks-list" class="track-list"></div>
+    <div class="artist-tabs" aria-label="Разделы страницы артиста">
+      <button class="ui-button" id="artist-albums-tab" type="button" aria-controls="artist-albums-panel"
+              aria-pressed="false" onclick="selectArtistTab('albums')">Альбомы</button>
+      <button class="ui-button" id="artist-tracks-tab" type="button" aria-controls="artist-tracks-panel"
+              aria-pressed="true" onclick="selectArtistTab('tracks')">Все треки</button>
+    </div>
+    <div id="artist-albums-panel" hidden></div>
+    <div id="artist-tracks-panel">
+      <div id="artist-tracks-list" class="track-list"></div>
+      <p id="artist-tracks-status" class="artist-message" role="status"></p>
+      <button id="artist-tracks-more" class="ui-button artist-page-more" type="button"
+              onclick="loadArtistTrackPage(currentArtistView)" hidden>Ещё треки</button>
+    </div>
   </div>
 
   <div id="search-results-container">
@@ -2992,7 +3037,6 @@ let trackIdToAddToPlaylist = null;
 let isShuffle = false;
 let repeatMode = 'none';
 window.trendingArtists = [];
-window.currentArtistTracks = [];
 window.currentDisplayList = [];
 window.currentPlaylistContext = null;
 let userThemes = ['dark'];
@@ -3353,7 +3397,8 @@ function toggleLikeCurrent() {
 let allArtists = null;
 let showAllArtists = false;
 let hasMoreArtists = false;
-let currentArtistName = null;
+let currentArtistView = null;
+let artistPlayback = null;
 
 function artistCoverUrl(artist) {
   if (artist.has_custom_cover) return '/api/artist_cover?artist=' + encodeURIComponent(artist.artist);
@@ -3426,8 +3471,9 @@ function showArtistCover(artist, refresh = false) {
 async function uploadArtistCover(input) {
   const file = input.files[0];
   input.value = '';
-  if (!file || !isAdmin || !currentArtistName) return;
-  const artistName = currentArtistName;
+  const view = currentArtistView;
+  if (!file || !isAdmin || !view) return;
+  const artistName = view.name;
   const button = document.getElementById('artist-cover-button');
   button.disabled = true;
   try {
@@ -3436,7 +3482,10 @@ async function uploadArtistCover(input) {
     for (const artist of [...window.trendingArtists, ...(allArtists || [])]) {
       if (artist.artist.toLocaleLowerCase() === nameKey) artist.has_custom_cover = true;
     }
-    if (currentArtistName === artistName) showArtistCover({ artist: artistName, has_custom_cover: true }, true);
+    if (currentArtistView === view) {
+      view.profile = { ...view.profile, artist: artistName, has_custom_cover: true };
+      showArtistCover(view.profile, true);
+    }
     renderTrending();
     showToast('Обложка артиста сохранена');
   } catch (error) {
@@ -3447,71 +3496,238 @@ async function uploadArtistCover(input) {
 }
 
 async function viewArtist(artistName, artist = { artist: artistName }) {
-  currentArtistName = artistName;
+  const view = {
+    name: artistName, tracks: [], trackIds: new Set(), offset: 0,
+    trackRequest: null, trackError: false, profile: null, albums: null, albumView: null,
+  };
+  currentArtistView = view;
   document.getElementById('trending-container').style.display = 'none';
   document.getElementById('search-results-container').style.display = 'none';
   document.getElementById('artist-profile-container').style.display = 'block';
   showArtistCover(artist);
   document.getElementById('artist-profile-name').innerText = artistName;
-  document.getElementById('artist-profile-stats').innerText = "Загрузка треков...";
-  const trackList = document.getElementById('artist-tracks-list');
-  trackList.innerHTML = Array(3).fill(`
-    <div class="skeleton-item">
-      <div class="skeleton-box skeleton-cover"></div>
-      <div class="skeleton-info"><div class="skeleton-box skeleton-line"></div><div class="skeleton-box skeleton-line short"></div></div>
-    </div>
-  `).join('');
-  try {
-    const response = await apiFetch(`/api/artist_tracks?artist=${encodeURIComponent(artistName)}`);
-    const data = await response.json();
-    if (currentArtistName !== artistName) return;
-    if (data.profile) showArtistCover(data.profile);
-    if (data.error || data.tracks.length === 0) {
-      trackList.innerHTML = '<p style="text-align:center; color:var(--text-muted);">У этого артиста пока нет треков в базе.</p>';
-      return;
-    }
-    window.currentArtistTracks = data.tracks;
-    document.getElementById('artist-profile-stats').innerText = countLabel(data.tracks.length);
-    let html = '';
-    data.tracks.forEach((track, index) => {
-      if (track.is_liked) userLikes.add(track.id);
-      const likedClass = userLikes.has(track.id) ? 'liked' : '';
-      html += `
-        <div class="track-item fade-in-item">
-          <div class="track-main" onclick="handleTrackClick(event, ${index}, 'artist')">
-            <img src="/api/cover/${track.id}" class="track-cover" loading="lazy" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
-            <div class="track-info">
-              <div class="track-title">${escapeHTML(track.title)}</div>
-              <div class="track-artist">${escapeHTML(track.artist)}</div>
-              <div class="track-badge">⭐ ${escapeHTML(track.quality)}</div>
-            </div>
-          </div>
-          <div class="track-actions">
-            <button class="icon-btn ${likedClass}" onpointerdown="event.stopPropagation(); event.preventDefault(); toggleLike(${track.id}, this)">
-              <svg style="pointer-events: none;" viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
-            </button>
-            <button class="icon-btn" onpointerdown="event.stopPropagation(); event.preventDefault(); openTrackSheet(${index}, null, 'artist')" title="Действия">
-              <svg style="pointer-events: none;" viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
-            </button>
-          </div>
-        </div>
-      `;
+  document.getElementById('artist-profile-stats').innerText = '';
+  document.getElementById('artist-tracks-list').replaceChildren();
+  document.getElementById('artist-albums-panel').replaceChildren();
+  selectArtistTab('tracks');
+  return loadArtistTrackPage(view);
+}
+
+function selectArtistTab(tab) {
+  const view = currentArtistView;
+  if (!view) return;
+  for (const section of ['albums', 'tracks']) {
+    const selected = section === tab;
+    document.getElementById(`artist-${section}-tab`).setAttribute('aria-pressed', String(selected));
+    document.getElementById(`artist-${section}-panel`).hidden = !selected;
+  }
+  if (tab === 'albums' && !view.albums && !view.albumRequest) loadArtistAlbums(view);
+}
+
+function artistEndpoint(view, endpoint) {
+  return `/api/${endpoint}?artist=${encodeURIComponent(view.name)}`;
+}
+
+function renderArtistTrack(entry, play, showPosition = false) {
+  const track = entry.track;
+  const row = document.createElement('div');
+  row.className = 'track-item';
+  const position = showPosition ? `<span class="artist-track-number">${entry.position}</span>` : '';
+  const info = `<span class="track-info">
+    <span class="track-title">${escapeHTML(entry.title)}</span>
+    <span class="track-artist">${escapeHTML(entry.artist)}</span>
+    <span class="track-badge">${track ? '⭐ ' + escapeHTML(track.quality) : 'Недоступен'}</span>
+  </span>`;
+  if (!track) {
+    row.classList.add('artist-track-unavailable');
+    row.innerHTML = `<div class="track-main">${position}${info}</div>`;
+    return row;
+  }
+  if (track.is_liked) userLikes.add(track.id);
+  row.innerHTML = `
+    <button type="button" class="track-main artist-track-main">
+      ${position}<img src="/api/cover/${track.id}" alt="" class="track-cover" loading="lazy">${info}
+    </button>
+    <div class="track-actions">
+      <button type="button" class="icon-btn ${userLikes.has(track.id) ? 'liked' : ''}" aria-label="Нравится">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+      </button>
+      <button type="button" class="icon-btn" aria-label="Действия" title="Действия">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
+      </button>
+    </div>`;
+  row.querySelector('.track-main').onclick = play;
+  const image = row.querySelector('img');
+  image.onerror = () => {
+    image.onerror = null;
+    image.src = 'https://cdn-icons-png.flaticon.com/512/3844/3844724.png';
+  };
+  const [like, actions] = row.querySelectorAll('.icon-btn');
+  like.onclick = () => toggleLike(track.id, like);
+  actions.onclick = () => showTrackSheet(track, null);
+  return row;
+}
+
+function updateArtistTrackControls(view) {
+  if (currentArtistView !== view) return;
+  const status = document.getElementById('artist-tracks-status');
+  const more = document.getElementById('artist-tracks-more');
+  status.textContent = view.trackError ? 'Ошибка загрузки треков.' :
+    view.trackRequest && !view.tracks.length ? 'Загрузка треков…' :
+    view.offset === null && !view.tracks.length ? 'У этого артиста пока нет одобренных треков.' : '';
+  more.hidden = view.offset === null || (!view.tracks.length && !view.trackError);
+  more.disabled = !!view.trackRequest;
+  more.textContent = view.trackRequest ? 'Загрузка…' : view.trackError ? 'Повторить' : 'Ещё треки';
+}
+
+function loadArtistTrackPage(view) {
+  if (!view || view.offset === null) return Promise.resolve(true);
+  if (view.trackRequest) return view.trackRequest;
+  const path = artistEndpoint(view, 'artist_tracks') + '&offset=' + view.offset;
+  view.trackError = false;
+  view.trackRequest = checkedApi(path).then(data => {
+    view.offset = data.next_offset;
+    const previousLength = view.tracks.length;
+    const added = data.tracks.filter(track => {
+      if (view.trackIds.has(track.id)) return false;
+      view.trackIds.add(track.id);
+      return true;
     });
-    trackList.innerHTML = html;
-  } catch(e) {
-    trackList.innerHTML = '<p style="text-align:center; color:var(--red);">Ошибка загрузки треков.</p>';
+    view.tracks.push(...added);
+    if (artistPlayback?.view === view && artistPlayback.queue === audioQueue) audioQueue.push(...added);
+    if (currentArtistView === view) {
+      if (!view.profile) showArtistCover(data.profile);
+      document.getElementById('artist-profile-stats').innerText = countLabel(data.total);
+      const rows = added.map((track, index) => renderArtistTrack({ ...track, track }, () => {
+        playArtistQueue(view.tracks, previousLength + index, view);
+      }));
+      document.getElementById('artist-tracks-list').append(...rows);
+    }
+    view.profile = data.profile;
+    return true;
+  }).catch(() => {
+    view.trackError = true;
+    return false;
+  }).finally(() => {
+    view.trackRequest = null;
+    updateArtistTrackControls(view);
+  });
+  updateArtistTrackControls(view);
+  return view.trackRequest;
+}
+
+function renderArtistAlbumList(view) {
+  const panel = document.getElementById('artist-albums-panel');
+  panel.replaceChildren();
+  if (!view.albums.length) {
+    panel.innerHTML = '<p class="artist-message">Альбомы пока не добавлены.</p>';
+    return;
+  }
+  const isSmallRelease = album => ['single', 'ep'].includes(album.release_type);
+  const groups = [[null, view.albums.filter(album => !isSmallRelease(album))],
+    ['Синглы и EP', view.albums.filter(isSmallRelease)]];
+  for (const [label, albums] of groups) {
+    if (!albums.length) continue;
+    if (label) {
+      const heading = document.createElement('h3');
+      heading.textContent = label;
+      panel.appendChild(heading);
+    }
+    const grid = document.createElement('div');
+    grid.className = 'artist-album-group';
+    for (const album of albums) {
+      const card = document.createElement('button');
+      card.type = 'button';
+      card.className = 'ui-button artist-album-card';
+      const coverPath = artistEndpoint(view, `artist_albums/${encodeURIComponent(album.album_id)}/cover`);
+      card.innerHTML = `
+        <span class="artist-album-art" aria-hidden="true">${album.has_cover ?
+          `<img alt="" loading="lazy" src="${escapeHTML(coverPath)}">` : '♪'}</span>
+        <strong class="artist-album-title">${escapeHTML(album.title)}</strong>
+        ${album.year ? `<span class="artist-album-meta">${escapeHTML(album.year)}</span>` : ''}
+        <span class="artist-album-meta">${album.available_count} из ${album.track_count} доступны</span>`;
+      card.onclick = () => openArtistAlbum(view, album.album_id);
+      grid.appendChild(card);
+    }
+    panel.appendChild(grid);
+  }
+}
+
+async function loadArtistAlbums(view) {
+  const panel = document.getElementById('artist-albums-panel');
+  panel.innerHTML = '<p class="artist-message" role="status">Загрузка альбомов…</p>';
+  view.albumRequest = checkedApi(artistEndpoint(view, 'artist_albums'));
+  try {
+    view.albums = (await view.albumRequest).albums;
+    if (currentArtistView === view) renderArtistAlbumList(view);
+  } catch {
+    if (currentArtistView === view) {
+      panel.innerHTML = '<p class="artist-message">Ошибка загрузки альбомов.</p><button class="ui-button" type="button">Повторить</button>';
+      panel.querySelector('button').onclick = () => loadArtistAlbums(view);
+    }
+  } finally {
+    view.albumRequest = null;
+  }
+}
+
+async function openArtistAlbum(view, albumId) {
+  const selection = {};
+  view.albumView = selection;
+  const panel = document.getElementById('artist-albums-panel');
+  panel.innerHTML = `<button class="btn-back" type="button">← К альбомам</button>
+    <div><p class="artist-message" role="status">Загрузка состава…</p></div>`;
+  panel.querySelector('button').onclick = () => {
+    view.albumView = null;
+    renderArtistAlbumList(view);
+  };
+  const content = panel.lastElementChild;
+  try {
+    const path = artistEndpoint(view, `artist_albums/${encodeURIComponent(albumId)}`);
+    const { album } = await checkedApi(path);
+    if (currentArtistView !== view || view.albumView !== selection) return;
+    content.innerHTML = `<h3 class="artist-album-heading">${escapeHTML(album.title)}</h3>
+      ${album.year ? `<p class="artist-album-meta">${escapeHTML(album.year)}</p>` : ''}`;
+    const queue = album.tracks.flatMap(entry => entry.track ? [entry.track] : []);
+    if (!album.tracks.length) {
+      content.insertAdjacentHTML('beforeend', '<p class="artist-message">В релизе нет треков.</p>');
+    }
+    const multipleDiscs = new Set(album.tracks.map(track => track.disc)).size > 1;
+    let currentDisc, list, nextIndex = 0;
+    for (const entry of album.tracks) {
+      if (entry.disc !== currentDisc) {
+        currentDisc = entry.disc;
+        if (multipleDiscs) {
+          const heading = document.createElement('h4');
+          heading.className = 'artist-disc-heading';
+          heading.textContent = 'Диск ' + currentDisc;
+          content.appendChild(heading);
+        }
+        list = document.createElement('div');
+        list.className = 'track-list';
+        content.appendChild(list);
+      }
+      const index = nextIndex;
+      list.appendChild(renderArtistTrack(entry, () => playArtistQueue(queue, index), true));
+      if (entry.track) nextIndex++;
+    }
+  } catch {
+    if (currentArtistView === view && view.albumView === selection) {
+      content.innerHTML = '<p class="artist-message">Ошибка загрузки состава.</p><button class="ui-button" type="button">Повторить</button>';
+      content.querySelector('button').onclick = () => openArtistAlbum(view, albumId);
+    }
   }
 }
 
 function closeArtistProfile() {
-  currentArtistName = null;
+  currentArtistView = null;
   document.getElementById('artist-profile-container').style.display = 'none';
   document.getElementById('search-results-container').style.display = 'block';
   document.getElementById('trending-container').style.display = 'block';
 }
 
-function playFromArtist(index) {
-  audioQueue = window.currentArtistTracks;
+function playArtistQueue(tracks, index, view = null) {
+  audioQueue = tracks.slice();
+  artistPlayback = view ? { view, queue: audioQueue } : null;
   currentAudioIndex = index;
   playCurrentTrack();
 }
@@ -3520,9 +3736,9 @@ function playFromArtist(index) {
 // ПОИСК
 // ============================================
 async function searchMusic() {
-  currentArtistName = null;
   const query = document.getElementById('search-input').value.trim();
   if (!query) return;
+  currentArtistView = null;
   document.getElementById('trending-container').style.display = 'none';
   document.getElementById('artist-profile-container').style.display = 'none';
   document.getElementById('search-results-container').style.display = 'block';
@@ -3541,7 +3757,7 @@ async function searchMusic() {
     const data = await response.json();
     if (data.error || data.tracks.length === 0) {
       resultsDiv.innerHTML = '<p style="text-align:center; color:var(--text-muted);">Ничего не найдено 😔</p>';
-      document.getElementById('trending-container').style.display = 'block';
+      if (!currentArtistView) document.getElementById('trending-container').style.display = 'block';
       return;
     }
     window.currentDisplayList = data.tracks;
@@ -3550,13 +3766,17 @@ async function searchMusic() {
     data.tracks.forEach((track, index) => {
       if (track.is_liked) userLikes.add(track.id);
       const likedClass = userLikes.has(track.id) ? 'liked' : '';
+      const artists = track.page_artists || [track.page_artist || track.artist].filter(Boolean);
+      const artistLinks = artists.map(name => `
+        <button class="search-artist-link" type="button" data-artist-page="${escapeHTML(name)}">${escapeHTML(name)}</button>
+      `.trim()).join(', ');
       html += `
         <div class="track-item fade-in-item">
-          <div class="track-main" onclick="handleTrackClick(event, ${index}, 'search')">
+          <div class="track-main" onclick="handleTrackClick(event, ${index})">
             <img src="/api/cover/${track.id}" class="track-cover" loading="lazy" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
             <div class="track-info">
               <div class="track-title">${escapeHTML(track.title)}</div>
-              <div class="track-artist">${escapeHTML(track.artist)}</div>
+              <div class="track-artist search-artist-links">${artistLinks}</div>
               <div class="track-badge">⭐ ${escapeHTML(track.quality)}</div>
             </div>
           </div>
@@ -3572,6 +3792,12 @@ async function searchMusic() {
       `;
     });
     resultsDiv.innerHTML = html;
+    resultsDiv.querySelectorAll('[data-artist-page]').forEach(button => {
+      button.onclick = event => {
+        event.stopPropagation();
+        viewArtist(button.dataset.artistPage);
+      };
+    });
 
     const similarDiv = document.getElementById('similar-artists-container');
     if (data.similar_artists && data.similar_artists.length > 0) {
@@ -3601,11 +3827,11 @@ function playFromList(index) {
 // ШТОРКА ТРЕКА
 // ============================================
 function openTrackSheet(index, playlistId, contextType) {
-  let track;
-  if (contextType === 'artist') track = window.currentArtistTracks[index];
-  else if (contextType === 'trending') track = window.trendingList[index];
-  else if (contextType === 'likes') track = window.currentDisplayList[index];
-  else track = window.currentDisplayList[index];
+  const track = contextType === 'trending' ? window.trendingList[index] : window.currentDisplayList[index];
+  showTrackSheet(track, playlistId);
+}
+
+function showTrackSheet(track, playlistId) {
   if (!track) return;
 
   currentSheetTrack = track;
@@ -3939,7 +4165,7 @@ function playPrevTrack() {
   }
 }
 
-function playNextTrack(fromEnded = false) {
+async function playNextTrack(fromEnded = false) {
   if (!audioQueue.length) return;
   const audio = document.getElementById('audio-element');
   if (fromEnded && repeatMode === 'one') {
@@ -3955,6 +4181,20 @@ function playNextTrack(fromEnded = false) {
     currentAudioIndex = newIndex;
     playCurrentTrack();
     return;
+  }
+  const continuation = artistPlayback;
+  if (continuation?.queue === audioQueue && currentAudioIndex === audioQueue.length - 1) {
+    const index = currentAudioIndex;
+    const request = playbackRequest;
+    while (continuation.view.offset !== null && audioQueue.length === index + 1) {
+      const loaded = await loadArtistTrackPage(continuation.view);
+      if (continuation.queue !== audioQueue || currentAudioIndex !== index || playbackRequest !== request) return;
+      if (!loaded) {
+        if (fromEnded) setPlaybackState(false);
+        showToast('Не удалось загрузить следующие треки.', true);
+        return;
+      }
+    }
   }
   currentAudioIndex++;
   if (currentAudioIndex < audioQueue.length) {
@@ -3985,6 +4225,7 @@ function closePlayer(event) {
   playerBar.classList.remove('show');
   closeFullPlayer();
   audioQueue = [];
+  artistPlayback = null;
   currentAudioIndex = 0;
   setPlaybackState(false);
   if ('mediaSession' in navigator) {
@@ -4281,7 +4522,7 @@ function renderLikedTracks(tracks, rows, query) {
         const quality = track.quality_status !== 'none' ? track.quality_status : 'Verified';
         html += `
           <div class="track-item fade-in-item">
-            <div class="track-main" onclick="handleTrackClick(event, ${index}, 'likes')">
+            <div class="track-main" onclick="handleTrackClick(event, ${index})">
               <img src="/api/cover/${track.id}" class="track-cover" loading="lazy" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
               <div class="track-info">
                 <div class="track-title">${escapeHTML(track.title)}</div>
@@ -4754,7 +4995,7 @@ async function viewPlaylist(playlistId) {
         const isLiked = userLikes.has(track.id) ? 'liked' : '';
         html += `
           <div class="track-item fade-in-item">
-            <div class="track-main" onclick="handleTrackClick(event, ${index}, 'playlist')">
+            <div class="track-main" onclick="handleTrackClick(event, ${index})">
               <img src="/api/cover/${track.id}" class="track-cover" loading="lazy" onerror="this.src='https://cdn-icons-png.flaticon.com/512/3844/3844724.png'">
               <div class="track-info">
                 <div class="track-title">${escapeHTML(track.title)}</div>
@@ -5214,15 +5455,17 @@ async function toggleLoopSetting(checkbox) {
 // ВОЛНА
 // ============================================
 async function startWave() {
-  currentArtistName = null;
+  const artistView = currentArtistView;
   showToast("🌊 Собираю рекомендации...");
   try {
     const res = await apiFetch('/api/wave');
     const data = await res.json();
     if (data.error) return showToast(data.error, true);
+    if (currentArtistView && currentArtistView !== artistView) return;
     if (!data.tracks || data.tracks.length === 0) {
       return showToast("В базе пока мало треков для рекомендаций", true);
     }
+    currentArtistView = null;
     audioQueue = data.tracks;
     currentAudioIndex = 0;
     document.getElementById('trending-container').style.display = 'none';
@@ -5288,14 +5531,9 @@ function handleStartParam() {
 // ============================================
 // ОБРАБОТКА КЛИКА ПО ТРЕКУ
 // ============================================
-function handleTrackClick(event, index, context) {
+function handleTrackClick(event, index) {
     if (event.target.closest('.track-actions')) return;
-    
-    if (context === 'artist') {
-        playFromArtist(index);
-    } else {
-        playFromList(index);
-    }
+    playFromList(index);
 }
 
 // ============================================

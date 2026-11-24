@@ -33,6 +33,8 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from dotenv import load_dotenv
 
 from backend.config import TELEGRAM_BOT_TOKEN, ADMIN_ID
+from backend.artist_import import worker as artist_import_worker
+from backend.artist_import_bot import register as register_artist_import
 from backend.import_messages import PLAYLIST_IMPORT_INSTRUCTIONS
 from backend.database import (
     get_hunt_tracks, get_user, import_playlist, init_db, upload_track, add_points,
@@ -79,6 +81,7 @@ bot: Bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp: Dispatcher = Dispatcher()
+register_artist_import(dp)
 
 waiting_for_replacement = {}
 processing_full_tracks = set()
@@ -1060,7 +1063,12 @@ async def cmd_get_track(message: Message) -> None:
 @dp.message(Command("admin"))
 async def cmd_admin_panel(message: Message) -> None:
     if message.from_user.id != ADMIN_ID: return
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎧 Модерация", callback_data="admin_moderate")], [InlineKeyboardButton(text="📊 Баланс Stars", callback_data="admin_stars")], [InlineKeyboardButton(text="📖 Справка", callback_data="admin_help")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎧 Модерация", callback_data="admin_moderate")],
+        [InlineKeyboardButton(text="🎵 Импорт артистов", callback_data="yaimp:list")],
+        [InlineKeyboardButton(text="📊 Баланс Stars", callback_data="admin_stars")],
+        [InlineKeyboardButton(text="📖 Справка", callback_data="admin_help")],
+    ])
     await message.answer("👑 <b>Админ-панель</b>", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("admin_"))
@@ -1081,6 +1089,7 @@ async def process_admin_panel(callback: CallbackQuery):
             "<b>Админ-команды:</b>\n"
             "<code>/admin</code>\n"
             "<code>/moderate</code>\n"
+            "<code>/import_artist_yandex [ID или ссылка]</code> — партии импорта и модерация артистов\n"
             "<code>/deletetrack &lt;id&gt;</code>\n"
             "<code>/addlimit &lt;id&gt; &lt;число&gt;</code>\n"
             "<code>/resetlimit</code>\n"
@@ -1797,6 +1806,7 @@ async def register_bot_commands() -> None:
         admin_commands = [
             BotCommand(command="admin", description="Админ-панель"),
             BotCommand(command="moderate", description="Модерация треков"),
+            BotCommand(command="import_artist_yandex", description="Импорт артиста из Яндекс Музыки и проверка аудио"),
             BotCommand(command="deletetrack", description="Удалить трек · <id трека>"),
             BotCommand(command="addlimit", description="Установить лимит · [<id пользователя>] <число>"),
             BotCommand(command="resetlimit", description="Сбросить свой счётчик скачиваний"),
@@ -1820,12 +1830,14 @@ async def main() -> None:
     asyncio.create_task(offline_purge_worker(bot))
     asyncio.create_task(premium_lifecycle_worker())
     sync_worker = asyncio.create_task(playlist_sync_worker(request_sync_download, send_sync_notice))
+    artist_worker = asyncio.create_task(artist_import_worker())
     log("Запуск бота...")
     try:
         await dp.start_polling(bot)
     finally:
         sync_worker.cancel()
-        await asyncio.gather(sync_worker, return_exceptions=True)
+        artist_worker.cancel()
+        await asyncio.gather(sync_worker, artist_worker, return_exceptions=True)
 
 if __name__ == "__main__":
     try: asyncio.run(main())

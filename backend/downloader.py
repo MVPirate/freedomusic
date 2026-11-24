@@ -8,19 +8,22 @@ from collections.abc import Iterator
 from pathlib import Path
 import logging
 from tempfile import TemporaryDirectory
+from threading import Lock
+from time import monotonic
 import uuid
 import re
+from urllib.parse import urlsplit
 
 # Общие функции очистки/сравнения названий, проверки версий и длительности живут в hitmo_parser.py
 try:
     from .hitmo_parser import (
         split_artists, clean_title, build_search_queries, match_track, norm, download_from_hitmo,
-        duration_ok, mp3_length, has_bad_marker,
+        duration_ok, mp3_length, has_bad_marker, has_censored_label,
     )
 except ImportError:  # модуль запущен не как пакет (backend/ добавлен в sys.path)
     from hitmo_parser import (
         split_artists, clean_title, build_search_queries, match_track, norm, download_from_hitmo,
-        duration_ok, mp3_length, has_bad_marker,
+        duration_ok, mp3_length, has_bad_marker, has_censored_label,
     )
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,30 @@ PROXIES_FILE = Path(__file__).resolve().parent / "proxies.txt"
 
 SC_MAX_DOWNLOAD_ATTEMPTS = 4   # сколько кандидатов максимум пробуем скачать на один трек
 SC_MAX_QUERIES = 4             # сколько вариантов поискового запроса максимум
+SC_COOLDOWN_SECONDS = 120
+_sc_retry_at = 0.0
+_sc_cooldown_lock = Lock()
+
+
+class SoundCloudForbidden(Exception):
+    pass
+
+
+def _sc_in_cooldown() -> bool:
+    return monotonic() < _sc_retry_at
+
+
+def _sc_pause() -> None:
+    global _sc_retry_at
+    with _sc_cooldown_lock:
+        if _sc_in_cooldown():
+            return
+        _sc_retry_at = monotonic() + SC_COOLDOWN_SECONDS
+    logger.warning("SoundCloud: доступ отклонён (HTTP 403). Следующие %s с использую Hitmo.", SC_COOLDOWN_SECONDS)
+
+
+def _sc_forbidden(error: Exception) -> bool:
+    return bool(re.search(r"\bHTTP Error 403\b", str(error)))
 
 # SoundCloud в свежих yt-dlp ходит через имперсонацию браузера (curl_cffi). Без неё на VPS
 # страница артиста/поиск может вернуть пусто/403 — а локально (yt-dlp[default] + curl_cffi) всё работало.
@@ -118,15 +145,15 @@ def _embed_cover_bytes(file_path: str, raw: bytes) -> bool:
 # ============================================================
 # SOUNDCLOUD (запасной источник)
 # ============================================================
-def _sc_candidate_ok(entry: dict, artist: str, title: str, duration: int, check_artist: bool = True) -> bool:
-    url = entry.get('url')
+def _sc_candidate_ok(entry: dict, artist: str, title: str, duration: int, check_artist: bool = True,
+                     allow_short: bool = False) -> bool:
     etitle = entry.get('title') or ''
-    if not url or not etitle:
+    if not etitle:
         return False
     if has_bad_marker(etitle, title):
         return False  # slowed / 8D / remix / live / cover ... (если этого нет в самом запросе)
     dur = entry.get('duration') or 0
-    if dur and dur < 60:
+    if dur and dur < 60 and not allow_short:
         return False  # 30-секундные Go+ превью и обрывки
     if duration and dur and not duration_ok(dur, duration):
         return False  # замедленные/ускоренные/удлинённые версии
@@ -139,6 +166,8 @@ def _sc_search(query: str, limit: int = 10) -> list[dict]:
             result = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
         return [e for e in ((result or {}).get('entries') or []) if e]
     except Exception as e:
+        if _sc_forbidden(e):
+            raise SoundCloudForbidden("поиск вернул HTTP 403") from e
         logger.error(f"Ошибка поиска SoundCloud по '{query}': {e}")
         return []
 
@@ -166,7 +195,7 @@ def _sc_download(url: str, ydl_opts: dict, base_path: Path) -> str | None:
     opts = dict(ydl_opts)
     if proxy_list:
         opts['proxy'] = random.choice(proxy_list)
-        logger.info(f"Использую прокси: {opts['proxy']}")
+        logger.info("SoundCloud: использую настроенный прокси.")
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
@@ -176,18 +205,37 @@ def _sc_download(url: str, ydl_opts: dict, base_path: Path) -> str | None:
     except Exception as e:
         if "DRM" in str(e):
             logger.info(f"SoundCloud: трек защищён DRM, беру следующего кандидата ({url})")
+        elif _sc_forbidden(e):
+            raise SoundCloudForbidden("загрузка вернула HTTP 403") from e
         else:
             logger.warning(f"SoundCloud: не удалось скачать {url}: {e}")
     return None
 
-def _iter_matches(artist: str, title: str, duration: int) -> Iterator[str]:
+def is_soundcloud_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname or ""
+        return parsed.scheme in {"http", "https"} and (host == "soundcloud.com" or host.endswith(".soundcloud.com"))
+    except ValueError:
+        return False
+
+
+def _sc_public_url(url: str) -> bool:
+    return is_soundcloud_url(url) and urlsplit(url).hostname in {"soundcloud.com", "www.soundcloud.com"}
+
+
+def _iter_matches(artist: str, title: str, duration: int, prefer_uncensored=False) -> Iterator[str]:
     """Перебирает подходящие ссылки, запрашивая следующий источник только при необходимости."""
     seen: set[str] = set()
 
     def match_entries(entries: list[dict], check_artist: bool = True) -> Iterator[str]:
         for entry in entries:
-            url = entry.get('url')
-            if not url or url in seen or not _sc_candidate_ok(entry, artist, title, duration, check_artist):
+            webpage = entry.get('webpage_url') or ''
+            url = webpage if _sc_public_url(webpage) else entry.get('url')
+            allow_short = prefer_uncensored and 0 < duration < 60
+            if not url or url in seen or not _sc_candidate_ok(entry, artist, title, duration, check_artist, allow_short):
+                continue
+            if prefer_uncensored and (not is_soundcloud_url(url) or has_censored_label(entry["title"], title)):
                 continue
             seen.add(url)
             yield url
@@ -208,7 +256,7 @@ def _iter_matches(artist: str, title: str, duration: int) -> Iterator[str]:
             logger.error(f"Ошибка чтения белого списка: {e}")
 
     # 1. Официальная страница артиста — артиста внутри не проверяем, он и так «свой»
-    if artist_url:
+    if artist_url and (not prefer_uncensored or is_soundcloud_url(artist_url)):
         yield from match_entries(_sc_list_page(f"{artist_url}/tracks"), check_artist=False)
 
     # 2. Общий поиск: несколько вариантов запроса (главный артист + чистое название, все артисты, первые слова, ...)
@@ -240,24 +288,43 @@ def _download_candidate(url: str, destination: Path, duration: int) -> str | Non
     return str(destination)
 
 
-def _sync_download(artist: str, title: str, filename: str, duration: int = 0) -> tuple[str | None, str | None, str | None]:
-    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    destination = UPLOADS_DIR / f"{filename or 'track'}_{uuid.uuid4().hex[:12]}.mp3"
+def _sync_download(artist: str, title: str, filename: str, duration: int = 0, *,
+                   uploads_dir: Path = UPLOADS_DIR, prefer_uncensored=False) -> tuple[str | None, str | None, str | None]:
+    if _sc_in_cooldown():
+        return None, "cooldown", None
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    destination = uploads_dir / f"{(filename or 'track')[:55]}_{uuid.uuid4().hex[:12]}.mp3"
     attempts = 0
-    for attempts, url in enumerate(_iter_matches(artist, title, duration), start=1):
-        path = _download_candidate(url, destination, duration)
-        if path:
-            return path, None, _sc_webpage_url(url) or url
-        if attempts >= SC_MAX_DOWNLOAD_ATTEMPTS:
-            break
+    forbidden = 0
+    try:
+        for attempts, url in enumerate(_iter_matches(artist, title, duration, prefer_uncensored), start=1):
+            if _sc_in_cooldown():
+                return None, "cooldown", None
+            try:
+                path = _download_candidate(url, destination, duration)
+            except SoundCloudForbidden:
+                forbidden += 1
+                if forbidden >= 2:
+                    raise
+                logger.info("SoundCloud: кандидат вернул HTTP 403, проверяю другую запись.")
+            else:
+                if path:
+                    return path, None, url if _sc_public_url(url) else (_sc_webpage_url(url) or url)
+            if attempts >= SC_MAX_DOWNLOAD_ATTEMPTS:
+                break
+    except SoundCloudForbidden:
+        _sc_pause()
+        return None, "forbidden", None
 
     logger.info(f"SoundCloud: ничего не подошло для {artist} - {title} (попыток скачивания: {attempts})")
     return None, "error", None
 
-async def download_track_from_youtube(artist: str, title: str, duration: int = 0) -> tuple[str | None, str | None, str | None]:
+async def download_track_from_youtube(artist: str, title: str, duration: int = 0, *,
+                                      uploads_dir: Path = UPLOADS_DIR, prefer_uncensored=False) -> tuple[str | None, str | None, str | None]:
     """Имя оставлено прежним для совместимости (на деле — SoundCloud). duration (сек) — необязательная сверка длины."""
     safe_name = "".join(c for c in f"{artist} - {title}" if c.isalnum() or c in " -_").strip()
-    return await asyncio.to_thread(_sync_download, artist, title, safe_name, duration)
+    return await asyncio.to_thread(_sync_download, artist, title, safe_name, duration,
+                                   uploads_dir=uploads_dir, prefer_uncensored=prefer_uncensored)
 
 
 # ============================================================
@@ -265,7 +332,8 @@ async def download_track_from_youtube(artist: str, title: str, duration: int = 0
 # ============================================================
 # Яндекс используется ТОЛЬКО для метаданных плейлиста (artist, title, duration, yandex_id).
 # Аудио оттуда не качаем: Яндекс отдаёт цензурированные версии.
-async def download_track_smart(track: dict) -> tuple[str | None, str | None, str | None]:
+async def download_track_smart(track: dict, *, uploads_dir: Path = UPLOADS_DIR,
+                               prefer_uncensored=False) -> tuple[str | None, str | None, str | None]:
     """track = {'artist', 'title', 'duration'?, ...}  ->  (file_path | None, err | None, source_url | None)."""
     artist = track.get('artist') or ''
     title = track.get('title') or ''
@@ -273,7 +341,8 @@ async def download_track_smart(track: dict) -> tuple[str | None, str | None, str
     last_err = None
 
     # 1. SoundCloud — ОСНОВНОЙ источник (там 99% без цензуры)
-    path, err, src = await download_track_from_youtube(artist, title, duration)
+    path, err, src = await download_track_from_youtube(artist, title, duration,
+                                                       uploads_dir=uploads_dir, prefer_uncensored=prefer_uncensored)
     if path:
         return path, None, src
     last_err = err
@@ -281,24 +350,25 @@ async def download_track_smart(track: dict) -> tuple[str | None, str | None, str
 
     # 2. Hitmo — ЗАПАСНОЙ (через прокси, если SoundCloud не смог)
     try:
-        path, err, src = await download_from_hitmo(artist, title, UPLOADS_DIR, duration)
+        path, err, src = await download_from_hitmo(artist, title, uploads_dir, duration,
+                                                 prefer_uncensored=prefer_uncensored)
         if path:
-            ensure_track_has_cover(path, artist, title)
+            await asyncio.to_thread(ensure_track_has_cover, path, artist, title)
             return path, None, src
         last_err = err or last_err
     except Exception as e:
         logger.error(f"Hitmo упал на {artist} - {title}: {e}")
 
-    return None, (err or last_err or "not_found"), None
+    return None, (last_err or "not_found"), None
 
 
 # --- ФУНКЦИЯ: СКАЧИВАНИЕ ПО ПРЯМОЙ ССЫЛКЕ ---
 def _sync_download_by_url(
-    url: str, filename: str, *, proxy: str | None = None
+    url: str, filename: str, *, proxy: str | None = None, uploads_dir: Path = UPLOADS_DIR
 ) -> tuple[str | None, str | None, str | None]:
-    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    uploads_dir.mkdir(parents=True, exist_ok=True)
     unique_filename = f"{filename}_{uuid.uuid4().hex[:6]}"
-    base_path = UPLOADS_DIR / unique_filename
+    base_path = uploads_dir / unique_filename
     ydl_opts = _get_ydl_opts(base_path)
     if proxy:
         ydl_opts['proxy'] = proxy
@@ -316,9 +386,10 @@ def _sync_download_by_url(
         return None, "error", None
     return None, "error", None
 
-async def download_from_soundcloud_url(url: str, artist: str, title: str) -> tuple[str | None, str | None, str | None]:
-    safe_name = "".join(c for c in f"{artist} - {title}" if c.isalnum() or c in " -_").strip()
-    return await asyncio.to_thread(_sync_download_by_url, url, safe_name)
+async def download_from_soundcloud_url(url: str, artist: str, title: str, *,
+                                       uploads_dir: Path = UPLOADS_DIR) -> tuple[str | None, str | None, str | None]:
+    safe_name = "".join(c for c in f"{artist} - {title}" if c.isalnum() or c in " -_").strip()[:55]
+    return await asyncio.to_thread(_sync_download_by_url, url, safe_name, uploads_dir=uploads_dir)
 
 
 async def download_from_youtube_url(url: str, artist: str, title: str) -> tuple[str | None, str | None, str | None]:
@@ -369,6 +440,8 @@ def ensure_track_has_cover(file_path: str, artist: str, title: str) -> bool:
     """
     if _has_cover(file_path):
         return True
+    if _sc_in_cooldown():
+        return False
 
     try:
         main_artist = (split_artists(artist) or [artist])[0]

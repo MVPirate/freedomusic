@@ -16,6 +16,7 @@ import random
 import re
 import logging
 import time
+from contextlib import contextmanager
 from difflib import SequenceMatcher
 from html import unescape
 from pathlib import Path
@@ -297,6 +298,20 @@ def has_bad_marker(text: str, requested_title: str = "") -> bool:
     return any(p.search(t) and not p.search(req) for p in _BAD_PATTERNS)
 
 
+_UNCENSORED_LABEL = re.compile(r"\b(?:без\s+(?:цензуры|запик\w*)|no\s+(?:censorship|bleeps?))\b")
+_CENSORED_LABEL = re.compile(
+    r"\b(?:clean(?:\s+(?:edit|version))?|censored|radio\s+edit|цензурирован\w*|"
+    r"запик\w*|без\s+мата|с\s+цензурой)\b"
+)
+
+
+def has_censored_label(text: str, requested_title: str = "") -> bool:
+    label = _UNCENSORED_LABEL.sub("", norm(text))
+    base_title = re.split(r"[\[(]|\s+[-–—]\s+", requested_title, maxsplit=1)[0]
+    requested = {match[0] for match in _CENSORED_LABEL.finditer(norm(base_title))}
+    return any(match[0] not in requested for match in _CENSORED_LABEL.finditer(label))
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, default))
@@ -421,7 +436,7 @@ def _page_signature(page: str, with_description: bool = True) -> str:
     return " | ".join(" ".join(unescape(p).split()) for p in parts if p)
 
 
-def _iter_matches(session: requests.Session, artist: str, title: str, state: dict):
+def _iter_matches(session: requests.Session, artist: str, title: str, state: dict, prefer_uncensored=False):
     """Генератор подтверждённых кандидатов (url, html_страницы) от лучшего к худшему.
 
     Нужен именно генератор: у одного трека на Hitmo бывает несколько загрузок (оригинал, slowed,
@@ -459,17 +474,21 @@ def _iter_matches(session: requests.Session, artist: str, title: str, state: dic
             for url in _rank_candidates(cands, artist, title):
                 if url in seen:
                     continue
+                if prefer_uncensored and urlparse(url).hostname != urlparse(host).hostname:
+                    continue
                 if fetched >= HITMO_MAX_PAGE_FETCHES:
                     state["status"] = "not_found"
                     return
-                if cands[url] and has_bad_marker(cands[url], title):
+                if cands[url] and (has_bad_marker(cands[url], title)
+                                   or prefer_uncensored and has_censored_label(cands[url], title)):
                     continue  # в тексте ссылки уже видно slowed/remix/live — страницу не открываем
                 rr, _why = _get(session, url)
                 fetched += 1
                 if rr is None or rr.status_code != 200:
                     continue
                 seen.add(url)
-                if has_bad_marker(_page_signature(rr.text, with_description=False), title):
+                headline = _page_signature(rr.text, with_description=False)
+                if has_bad_marker(headline, title) or prefer_uncensored and has_censored_label(headline, title):
                     logger.info(f"[Hitmo] Пропускаю другую версию: {url}")
                     continue
                 sig = _page_signature(rr.text)
@@ -541,8 +560,30 @@ def _embed_hitmo_cover(session: requests.Session, page: str, dest: Path) -> None
         logger.error(f"[Hitmo] Не удалось вшить обложку: {e}")
 
 
+@contextmanager
+def _open_mp3(session: requests.Session, url: str, guard_redirects: bool):
+    options = dict(headers=HEADERS, timeout=(8, 120), stream=True, verify=False)
+    if not guard_redirects:
+        with session.get(url, **options) as response:
+            yield response
+        return
+
+    for _ in range(6):
+        parsed = urlparse(url)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or re.search(r"(?:^|\.)yandex\.[a-z]+$", parsed.hostname, re.IGNORECASE)):
+            raise ValueError("Hitmo вернул ссылку на неподходящий источник аудио.")
+        with session.get(url, allow_redirects=False, **options) as response:
+            if response.is_redirect:
+                url = urljoin(url, response.headers["Location"])
+                continue
+            yield response
+            return
+    raise ValueError("Hitmo вернул слишком много перенаправлений.")
+
+
 def _download_candidate(
-    session: requests.Session, track_url: str, page: str, dest: Path, duration: int
+    session: requests.Session, track_url: str, page: str, dest: Path, duration: int, prefer_uncensored=False
 ) -> tuple[bool, Optional[str]]:
     """Качает mp3 одного кандидата. -> (успех, err): err = 'error' | 'wrong_version'."""
     try:
@@ -552,7 +593,7 @@ def _download_candidate(
             return False, "error"
 
         logger.info(f"[Hitmo] Скачиваю: {mp3_url}")
-        with session.get(mp3_url, headers=HEADERS, timeout=(8, 120), stream=True, verify=False) as resp:
+        with _open_mp3(session, mp3_url, prefer_uncensored) as resp:
             resp.raise_for_status()
             with open(dest, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=8192):
@@ -584,14 +625,14 @@ def _download_candidate(
 
 
 def _sync_download_from_hitmo(
-    artist: str, title: str, uploads_dir: Path, duration: int = 0
+    artist: str, title: str, uploads_dir: Path, duration: int = 0, prefer_uncensored=False
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """Синхронная функция — вызывается из asyncio.to_thread."""
     uploads_dir.mkdir(parents=True, exist_ok=True)
 
     safe_name = "".join(
         c for c in f"{artist} - {title}" if c.isalnum() or c in " -_"
-    ).strip() or "track"
+    ).strip()[:55] or "track"
     dest = uploads_dir / f"hitmo_{safe_name}.mp3"
 
     session = _make_session()
@@ -599,9 +640,10 @@ def _sync_download_from_hitmo(
     tried = wrong = 0
 
     try:
-        for track_url, page in _iter_matches(session, artist, title, state):
+        for track_url, page in _iter_matches(session, artist, title, state, prefer_uncensored):
             tried += 1
-            ok, err = _download_candidate(session, track_url, page, dest, duration)
+            ok, err = _download_candidate(session, track_url, page, dest, duration,
+                                          prefer_uncensored=prefer_uncensored)
             if ok:
                 return str(dest), None, track_url
             if err == "wrong_version":
@@ -751,11 +793,11 @@ async def parse_artist_page_hitmo(url: str) -> list[dict]:
 
 
 async def download_from_hitmo(
-    artist: str, title: str, uploads_dir: Path, duration: int = 0
+    artist: str, title: str, uploads_dir: Path, duration: int = 0, *, prefer_uncensored=False
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """Асинхронная обёртка. Возвращает (file_path, err_type, source_url).
 
     err_type: 'not_found' (сайт ответил, подходящего трека нет) | 'error' (сайт недоступен/блокирует/сбой)
               | 'wrong_version' (кандидаты были, но ни один не прошёл по длительности).
     """
-    return await asyncio.to_thread(_sync_download_from_hitmo, artist, title, uploads_dir, duration)
+    return await asyncio.to_thread(_sync_download_from_hitmo, artist, title, uploads_dir, duration, prefer_uncensored)
