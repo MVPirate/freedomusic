@@ -94,7 +94,7 @@ app.add_middleware(
 @app.get("/", response_class=HTMLResponse)
 async def read_index():
     with open("frontend/index.html", "r", encoding="utf-8") as f:
-        return f.read()
+        return HTMLResponse(f.read(), headers={"Cache-Control": "no-cache"})
 
 def get_tg_user(request: Request) -> WebAppUser | None:
     auth_header = request.headers.get("Authorization", "")

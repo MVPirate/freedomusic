@@ -2847,7 +2847,7 @@ button.artist-track-main, .search-artist-link {
   <audio id="audio-element" onended="playNextTrack(true)" ontimeupdate="updateProgress()"
     onloadedmetadata="setDuration()" ondurationchange="setDuration()"
     onseeked="updateMediaPosition(this)" onratechange="updateMediaPosition(this)"
-    onplaying="updateMediaPosition(this)"></audio>
+    onplaying="initMediaSession(); updateMediaPosition(this)"></audio>
 </div>
 
 <!-- ============================================ -->
@@ -4205,15 +4205,14 @@ function setAudioLoading(loading) {
 function initMediaSession() {
   const session = navigator.mediaSession;
   if (!session?.setActionHandler) return;
-  const audio = document.getElementById('audio-element');
   const actions = {
     play: () => { if (!isPlaying) togglePlay(); },
     pause: () => { if (isPlaying) togglePlay(); },
     previoustrack: () => playPrevTrack(true),
     nexttrack: () => playNextTrack(),
     seekto: ({ seekTime }) => seekAudio(seekTime),
-    seekbackward: ({ seekOffset = 10 }) => seekAudio(audio.currentTime - seekOffset),
-    seekforward: ({ seekOffset = 10 }) => seekAudio(audio.currentTime + seekOffset),
+    seekbackward: null,
+    seekforward: null,
   };
   for (const [action, handler] of Object.entries(actions)) {
     try { session.setActionHandler(action, handler); }
